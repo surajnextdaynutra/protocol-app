@@ -1,0 +1,14 @@
+{
+  "include": ["**/*.js", "**/*.jsx"],
+  "exclude": ["node_modules", "build", "extensions/*/assets"],
+  "compilerOptions": {
+    "lib": ["DOM", "DOM.Iterable", "ES2022"],
+    "checkJs": false,
+    "jsx": "react-jsx",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "target": "ES2022",
+    "resolveJsonModule": true,
+    "baseUrl": "."
+  }
+}

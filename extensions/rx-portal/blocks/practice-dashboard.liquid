@@ -1,0 +1,130 @@
+{%- comment -%}
+  Rx Practice Dashboard - app block. Prints the viewer's ids (read from their customer
+  tags); assets/rx-dash.js loads the figures from the app, which checks those
+  ids against the logged-in customer before answering.
+{%- endcomment -%}
+{%- liquid
+  assign rx_practice = ''
+  assign rx_clinic = ''
+  assign rx_doctor = ''
+  assign rx_rep = ''
+  if customer
+    for tag in customer.tags
+      assign tl = tag | downcase | strip
+      assign tv = tag | split: ':' | last | strip
+      if tl contains 'practice_id:'
+        assign rx_practice = tv
+      elsif tl contains 'clinic_id:' and rx_clinic == ''
+        assign rx_clinic = tv
+      elsif tl contains 'doctor_id:'
+        assign rx_doctor = tv
+      elsif tl contains 'rep_id:'
+        assign rx_rep = tv
+      endif
+    endfor
+  endif
+-%}
+<div class="rxd"
+     style="--rxd-accent: {{ block.settings.accent }}; --rxd-max: {{ block.settings.max_width }}px;"
+     data-rx-dash="practice"
+     data-logged-in="{% if customer %}true{% else %}false{% endif %}"
+     data-practice="{{ rx_practice | escape }}"
+     data-clinic="{{ rx_clinic | escape }}"
+     data-doctor="{{ rx_doctor | escape }}"
+     data-rep="{{ rx_rep | escape }}"
+     data-rx-src="{{ 'rx-dash.js' | asset_url }}"
+     data-days="{{ block.settings.days }}"
+     data-currency="{{ cart.currency.iso_code }}"
+     data-login-text="{{ block.settings.login_text | escape }}"
+     data-noaccess-text="{{ block.settings.noaccess_text | escape }}"
+     {{ block.shopify_attributes }}>
+  <div class="rxd-head">
+    <div>
+      <h2 class="rxd-title">{{ block.settings.title | escape }}</h2>
+      {%- if block.settings.subtitle != blank -%}<p class="rxd-sub">{{ block.settings.subtitle | escape }}</p>{%- endif -%}
+    </div>
+    <div class="rxd-tools" data-rxd-tools></div>
+  </div>
+  <div data-rxd-content>
+    <div class="rxd-skeleton" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
+  </div>
+</div>
+
+{% schema %}
+{
+  "name": "Rx Practice Dashboard",
+  "target": "section",
+  "javascript": "rx-dash-loader.js",
+  "stylesheet": "rx-dash.css",
+  "enabled_on": {
+    "templates": [
+      "page"
+    ]
+  },
+  "settings": [
+    {
+      "type": "text",
+      "id": "title",
+      "label": "Heading",
+      "default": "Practice dashboard"
+    },
+    {
+      "type": "text",
+      "id": "subtitle",
+      "label": "Subheading"
+    },
+    {
+      "type": "select",
+      "id": "days",
+      "label": "Default period",
+      "default": "0",
+      "options": [
+        {
+          "value": "30",
+          "label": "Last 30 days"
+        },
+        {
+          "value": "90",
+          "label": "Last 90 days"
+        },
+        {
+          "value": "365",
+          "label": "Last 12 months"
+        },
+        {
+          "value": "0",
+          "label": "All time"
+        }
+      ]
+    },
+    {
+      "type": "color",
+      "id": "accent",
+      "label": "Accent colour",
+      "default": "#143056"
+    },
+    {
+      "type": "range",
+      "id": "max_width",
+      "label": "Maximum width",
+      "min": 800,
+      "max": 1600,
+      "step": 50,
+      "unit": "px",
+      "default": 1200
+    },
+    {
+      "type": "text",
+      "id": "login_text",
+      "label": "Logged-out message",
+      "default": "Please log in to view this dashboard."
+    },
+    {
+      "type": "text",
+      "id": "noaccess_text",
+      "label": "No-access message",
+      "default": "This dashboard is for Practice accounts."
+    }
+  ]
+}
+{% endschema %}

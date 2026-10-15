@@ -1,0 +1,141 @@
+{%- comment -%}
+  Rx Portal - app embed. Turn it on in the theme editor (App embeds).
+
+  With "Use the Rx Portal app as the backend" checked, every request the
+  theme's dashboards, prescription builder, cart and forms make to a Google
+  Apps Script web app is sent to this app instead (/apps/rx/...). No theme
+  file has to change, and unchecking it switches straight back.
+{%- endcomment -%}
+<script>
+  window.RxPortal = {
+    proxy: {{ block.settings.proxy | default: '/apps/rx' | json }},
+    redirect: {{ block.settings.redirect | json }},
+    customerId: {{ customer.id | default: '' | json }}
+  };
+</script>
+{%- if block.settings.redirect -%}
+  <script>
+{% raw %}/* Rx Portal - request redirect.
+
+   The theme's dashboards were written against Google Apps Script web apps
+   (https://script.google.com/macros/s/<deployment>/exec). This sends each of
+   those requests to the Rx Portal app's matching endpoint instead, so the
+   existing pages run on the new backend without any theme edits.
+
+   Inlined in <head> by the "Rx Portal" app embed, so it is in place before
+   any section script runs. */
+(function () {
+  if (window.__rxPortalShim) return;
+  window.__rxPortalShim = true;
+
+  var cfg = window.RxPortal || {};
+  var PROXY = String(cfg.proxy || '/apps/rx').replace(/\/+$/, '');
+
+  // First characters of each Apps Script deployment id -> app endpoint.
+  var DEPLOYMENTS = {
+    AKfycbztgpLx: 'builder',      // 1-rx-builder
+    AKfycbyobR48: 'cart',         // 2-rx-cart
+    AKfycbyuml4R: 'practice',     // 3-rx-practice
+    AKfycbzPJfgB: 'physician',    // 4-rx-physician
+    AKfycbw0PwkJ: 'rep',          // 5-rx-rep
+    AKfycbwjfUoQ: 'clinic',       // 6-rx-clinic
+    'AKfycby9-88A': 'finance',    // 7-rx-finance-admin
+    AKfycbzyrgEh: 'account',      // Account Settings API
+    AKfycbyEboqZ: 'banking',      // Rx Banking Details Form
+    AKfycbzIStlf: 'pricing',      // Product Price Management
+    AKfycbysy14A: 'about',        // rx-about-us-page
+    AKfycbwN0UkS: 'physicians',   // Rx Physician list
+    AKfycby9UOkJ: 'physicians',   // Rx Physician list (older deployment)
+    AKfycbxOnSTl: 'form',         // referral + contact form
+    AKfycbyPMpuM: 'support'       // contact-support-form
+  };
+  // Extra deployments can be added from the page: window.RxPortal.deployments
+  var extra = cfg.deployments || {};
+  for (var k in extra) if (Object.prototype.hasOwnProperty.call(extra, k)) DEPLOYMENTS[k] = extra[k];
+
+  var RE = /^https:\/\/script\.google\.com\/(?:a\/[^/]+\/)?macros\/s\/([A-Za-z0-9_-]+)\/exec/;
+  var warned = {};
+
+  /** An Apps Script exec URL -> the app's URL (query string kept); any other
+   *  URL is returned unchanged. */
+  function rewrite(url) {
+    if (typeof url !== 'string') return url;
+    var m = RE.exec(url);
+    if (!m) return url;
+    var id = m[1];
+    for (var prefix in DEPLOYMENTS) {
+      if (id.indexOf(prefix) === 0) return PROXY + '/' + DEPLOYMENTS[prefix] + url.slice(m[0].length);
+    }
+    if (!warned[id]) {
+      warned[id] = true;
+      console.warn('[rx-portal] no endpoint is mapped for Apps Script deployment ' + id.slice(0, 14) + '… - request left unchanged');
+    }
+    return url;
+  }
+  window.RxPortal = cfg;
+  cfg.rewrite = rewrite;
+
+  if (window.fetch) {
+    var nativeFetch = window.fetch;
+    window.fetch = function (input, init) {
+      try {
+        if (window.URL && input instanceof URL) input = input.href;
+        if (typeof input === 'string') {
+          var next = rewrite(input);
+          if (next !== input) {
+            // same-origin now: the Apps Script "no-cors" / "follow" options are not needed
+            var opts = {};
+            for (var key in (init || {})) opts[key] = init[key];
+            delete opts.mode;
+            delete opts.redirect;
+            opts.credentials = 'same-origin';
+            return nativeFetch.call(this, next, opts);
+          }
+        } else if (input && input.url && rewrite(input.url) !== input.url) {
+          return nativeFetch.call(this, new Request(rewrite(input.url), input), init);
+        }
+      } catch (e) { /* fall through to the untouched request */ }
+      return nativeFetch.apply(this, arguments);
+    };
+  }
+
+  if (window.XMLHttpRequest) {
+    var open = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (method, url) {
+      var args = Array.prototype.slice.call(arguments);
+      args[1] = rewrite(url);
+      return open.apply(this, args);
+    };
+  }
+
+  if (navigator.sendBeacon) {
+    var beacon = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = function (url, data) { return beacon(rewrite(url), data); };
+  }
+})();
+{% endraw %}
+  </script>
+{%- endif -%}
+
+{% schema %}
+{
+  "name": "Rx Portal",
+  "target": "head",
+  "settings": [
+    {
+      "type": "checkbox",
+      "id": "redirect",
+      "label": "Use the Rx Portal app as the backend",
+      "info": "Sends the portal's Google Apps Script requests to the app. Uncheck to go back to the Google scripts.",
+      "default": true
+    },
+    {
+      "type": "text",
+      "id": "proxy",
+      "label": "App proxy path",
+      "info": "Only change this if the app's proxy URL was customised in Settings > Apps.",
+      "default": "/apps/rx"
+    }
+  ]
+}
+{% endschema %}
