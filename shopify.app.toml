@@ -1,0 +1,62 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "0d2395bac316aca4f9626a5fc9f5332b"
+name = "Protocol Therapeutics"
+application_url = "https://sociology-conclusions-engaged-plus.trycloudflare.com"
+embedded = true
+
+[webhooks]
+api_version = "2027-01"
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/uninstalled"
+  topics = ["app/uninstalled"]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/scopes_update"
+  topics = ["app/scopes_update"]
+
+  # Orders: tagging, commission ledger, SMS, delivery status.
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/shopify"
+  topics = [
+    "orders/create",
+    "orders/paid",
+    "orders/updated",
+    "orders/fulfilled",
+    "orders/partially_fulfilled",
+    "orders/cancelled",
+    "orders/delete",
+  ]
+
+  # Customers: keeps the portal accounts (practice / clinic / physician / rep) current.
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/shopify"
+  topics = ["customers/create", "customers/update", "customers/delete"]
+
+  # Products: keeps the local catalogue (prices, commission rates) current.
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/shopify"
+  topics = ["products/create", "products/update", "products/delete"]
+
+  # Stock edited in Shopify admin on a base product -> the master's Inventory follows.
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/shopify"
+  topics = ["inventory_levels/update"]
+
+[access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
+scopes = "read_all_orders,read_customers,read_files,read_inventory,read_locations,read_metaobject_definitions,read_metaobjects,read_orders,read_products,read_publications,read_purchase_options,write_app_proxy,write_customers,write_files,write_inventory,write_metaobjects,write_orders,write_products,write_publications,write_purchase_options"
+
+[auth]
+redirect_urls = [ "https://sociology-conclusions-engaged-plus.trycloudflare.com/api/auth" ]
+
+[build]
+automatically_update_urls_on_dev = true
+
+# Storefront API: https://<store>/apps/rx/...  ->  <app>/proxy/...
+# Shopify signs each request and adds the logged-in customer's id.
+[app_proxy]
+url = "/proxy"
+subpath = "rx"
+prefix = "apps"
