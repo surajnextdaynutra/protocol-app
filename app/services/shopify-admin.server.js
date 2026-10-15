@@ -1,5 +1,5 @@
 import mongoose, { connectDb } from "../db.server";
-import { unauthenticated } from "../shopify.server";
+import { sessionStorage, unauthenticated } from "../shopify.server";
 
 /* Thin helpers over the Shopify GraphQL Admin API for background work
    (webhooks, jobs, app-proxy requests) - anywhere there is no admin browser
@@ -52,6 +52,26 @@ export async function getShop() {
 const NETWORK_ERR = /fetch failed|no response available|ECONNRESET|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|socket hang up|UND_ERR|other side closed|\b50[0-4]\b/i;
 const NETWORK_RETRY_MS = [1000, 3000, 8000];
 
+/* 401: Shopify no longer accepts the stored token - the app was uninstalled
+   (and maybe reinstalled) while its uninstall webhook couldn't reach us, so
+   the dead session was never removed. Opening the app in admin only fetches
+   a new token when there is no usable session, so the dead one is deleted
+   here; the next admin open reconnects and everything works again. */
+const UNAUTHORIZED = /\b401\b|Unauthorized/i;
+async function dropRejectedToken(shop) {
+  try {
+    const dead = await sessionStorage.findSessionsByShop(shop);
+    if (dead.length) {
+      await sessionStorage.deleteSessions(dead.map((s) => s.id));
+      console.error(`[rx] Shopify rejected the stored access token for ${shop} (401) - removed it. Open the app once in Shopify admin to reconnect.`);
+    }
+  } catch (e) {
+    console.warn("[rx] could not remove the rejected Shopify session:", e.message || e);
+  }
+  shopCache = null;
+  return new Error(`Shopify rejected the app's access token for ${shop} (401 Unauthorized) - the app was probably reinstalled. Open the app once in Shopify admin to reconnect it.`);
+}
+
 /* A create can't be repeated blindly: if the first try reached Shopify and
    only the answer was lost, a retry makes a second product / customer.
    Those fail once and are retried by their own job (which finds the first
@@ -85,6 +105,7 @@ export async function gql(query, variables = {}, shop) {
         await new Promise((r) => setTimeout(r, wait));
         continue;
       }
+      if (UNAUTHORIZED.test(msg)) throw await dropRejectedToken(shop);
       if (netTries) err.message = `${err.message} (after ${netTries} retries)`;
       throw err;
     }
