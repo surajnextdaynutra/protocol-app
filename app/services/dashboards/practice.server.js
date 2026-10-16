@@ -313,10 +313,11 @@ export async function practiceDashboard({
   // still-running month; Pending = finished months still unpaid.
   if (practice) {
     out.payouts = await payoutHistory("Practice", practice);
-    const sum = (st) => out.payouts.reduce((s, p) => s + (p.status === st ? p.amount : 0), 0);
-    out.commission.paid = sum("Paid");
-    out.commission.open = sum("Open");
-    out.commission.pending = sum("Pending");
+    // paid = money actually paid; open / pending = what is still owed
+    const due = (st) => out.payouts.reduce((s, p) => s + (p.status === st ? p.due : 0), 0);
+    out.commission.paid = out.payouts.reduce((s, p) => s + p.paid, 0);
+    out.commission.open = due("Open");
+    out.commission.pending = due("Pending");
   }
 
   return out;

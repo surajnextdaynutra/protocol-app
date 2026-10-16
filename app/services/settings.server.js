@@ -71,7 +71,7 @@ export const SETTINGS_DEFAULTS = [
   ["COMMISSION_PERCENT", "5", "Default commission % of purchased order totals, used when a doctor has no commission:X tag override", "commission"],
   ["COMMISSION_PER_UNIT", "1", "Sales rep commission in dollars per product unit sold.", "commission"],
   // --- product copies
-  ["PRODUCT_SYNC_DELETE_ORPHANS", "FALSE", "TRUE = when a practice's last physician is removed, delete that practice's product copies (after it has been missing on two sync runs). FALSE = only report them on the Products page.", "products"],
+  ["PRODUCT_SYNC_DELETE_ORPHANS", "FALSE", "TRUE = when a practice's last portal account is removed, delete that practice's product copies (after it has been missing on two sync runs). FALSE = only report them on the Products page.", "products"],
   ["LOCATION_ID", "", "Shopify inventory location id used for shared inventory. Blank = the store's primary location. Changing it re-stocks every copy at the new location from the master list.", "products"],
   ["PRODUCT_VENDOR", "Protocol Therapeutics", "Vendor on product copies when the master has no Vendor of its own.", "products"],
   // --- misc

@@ -98,11 +98,25 @@ async function sendEmailOnce({ to, subject, htmlBody, params, templateId }) {
   return result;
 }
 
+/* One character outside the GSM-7 set (curly quotes, long dashes, …) turns
+   the whole SMS into Unicode: 70 characters a part instead of 160, and some
+   North American carriers bounce it. The Apps Script templates were plain
+   ASCII; edited templates (and pasted text) often are not. */
+function gsmSafe(text) {
+  return String(text)
+    .replace(/[‘’‚‛′]/g, "'")
+    .replace(/[“”„‟″]/g, '"')
+    .replace(/[–—−]/g, "-")
+    .replace(/…/g, "...")
+    .replace(/[   ]/g, " ");
+}
+
 /**
  * Sends one SMS. A missing key / phone or the kill switch is a silent skip
  * (returns false) - SMS is always additive, never a reason to fail the caller.
  */
 export async function sendSms(phone, message) {
+  message = gsmSafe(message);
   const cfg = await getSettings();
   // skipped SMS are logged with the reason (they used to vanish silently)
   const skip = (why) => {
@@ -124,13 +138,23 @@ export async function sendSms(phone, message) {
   if (!digits) return skip("no phone number");
 
   try {
-    await brevoPost("/transactionalSMS/sms", apiKey, {
+    const res = await brevoPost("/transactionalSMS/sms", apiKey, {
       sender,
       recipient: digits,
       content: message,
       type: "transactional",
     });
-    logEvent("sms", digits, String(message).slice(0, 160));
+    // 201 = Brevo ACCEPTED it, not that it was delivered - delivery (or
+    // "skipped" / soft bounce) shows up later in Brevo's SMS logs. The
+    // messageId is kept so the two can be matched. usedCredits /
+    // remainingCredits in this reply read 0 even on an account with SMS
+    // credits, so they say nothing about the balance.
+    logEvent(
+      "sms",
+      digits,
+      `accepted by Brevo (messageId ${res.messageId ?? "?"}, ${res.smsCount ?? "?"} part(s)): ${String(message).slice(0, 160)}`,
+      { messageId: res.messageId ?? null, smsCount: res.smsCount ?? null, sender },
+    );
     return true;
   } catch (err) {
     logEvent("sms", digits, String(err), null, false);

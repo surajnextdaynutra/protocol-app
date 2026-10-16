@@ -23,7 +23,7 @@ const json = (body, status = 200, extraHeaders = {}) =>
    tracking, banking - always runs, and clears the cache afterwards. */
 const CACHEABLE = {
   builder: ["search", "patientHistory"],
-  practice: ["dashboard", "products", "practiceInfo", "clinicInfo", "practiceAccountInfo", "payoutOrders", "getAccount"],
+  practice: ["dashboard", "products", "earnings", "practiceInfo", "clinicInfo", "practiceAccountInfo", "payoutOrders", "getAccount"],
   physician: ["dashboard", "practiceInfo", "clinicName", "payoutOrders", "products", "getAccount"],
   clinic: ["dashboard", "getAccount"],
   rep: ["repdash"],

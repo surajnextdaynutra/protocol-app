@@ -2,10 +2,13 @@ import mongoose from "../db.server";
 
 const { Schema } = mongoose;
 
-/** Vite reloads this module in dev - reuse a compiled model instead of
- *  throwing OverwriteModelError. */
+/** Vite reloads this module in dev. The model is compiled again from the
+ *  schema just read: reusing the one compiled before kept serving the OLD
+ *  schema after an edit (new fields silently dropped on save) until the
+ *  server was restarted. deleteModel avoids OverwriteModelError. */
 function model(name, schema, collection) {
-  return mongoose.models[name] || mongoose.model(name, schema, collection);
+  if (mongoose.models[name]) mongoose.deleteModel(name);
+  return mongoose.model(name, schema, collection);
 }
 
 /* ---------------------------------------------------------------------------
@@ -218,15 +221,20 @@ const monthlyPayoutSchema = new Schema(
     month: { type: String, required: true }, // yyyy-MM
     role: { type: String, required: true }, // Practice / Doctor / Rep
     entityId: { type: String, required: true },
+    // record number within (month, role, id): a paid record is closed, and
+    // commission logged after it opens the next one (commission.server.js
+    // adjustMonthlyPayout) - at most one record per month is not Paid
+    seq: { type: Number, default: 0 },
     amount: { type: Number, default: 0 },
     status: { type: String, default: "Pending" },
     datePaid: { type: String, default: "" },
     transactionNo: { type: String, default: "" },
+    paidAt: { type: Date, default: null },
     note: { type: String, default: "" },
   },
   { timestamps: true },
 );
-monthlyPayoutSchema.index({ month: 1, role: 1, entityId: 1 }, { unique: true });
+monthlyPayoutSchema.index({ month: 1, role: 1, entityId: 1, seq: 1 }, { unique: true });
 monthlyPayoutSchema.index({ role: 1, entityId: 1 });
 export const MonthlyPayout = model(
   "MonthlyPayout",
@@ -365,6 +373,28 @@ const productSchema = new Schema(
   { timestamps: true },
 );
 export const Product = model("Product", productSchema, "products");
+
+/* ---------------------------------------------------------------------------
+   Earning overrides - the $ per unit a practice gives ONE of its clinics or
+   physicians on one product, in place of that product's default
+   custom.clinic_commission / custom.physician_commission. Keyed by the
+   master key (survives a re-created copy), else the product id - see
+   services/earnings.server.js productKey().
+   --------------------------------------------------------------------------- */
+const earningOverrideSchema = new Schema(
+  {
+    practiceId: { type: String, required: true },
+    productKey: { type: String, required: true },
+    role: { type: String, required: true }, // physician / clinic
+    entityId: { type: String, required: true }, // doctor_id / clinic_id
+    amount: { type: Number, default: 0 },
+    updatedBy: { type: String, default: "" },
+  },
+  { timestamps: true },
+);
+earningOverrideSchema.index({ practiceId: 1, productKey: 1, role: 1, entityId: 1 }, { unique: true });
+earningOverrideSchema.index({ practiceId: 1, role: 1, entityId: 1 });
+export const EarningOverride = model("EarningOverride", earningOverrideSchema, "earning_overrides");
 
 /* ---------------------------------------------------------------------------
    Banking details - replaces the banking metaobjects and the plain-text rep

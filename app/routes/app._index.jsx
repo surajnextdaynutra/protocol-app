@@ -21,6 +21,7 @@ import {
   SalesRep,
   WebhookEvent,
 } from "../models/index.server";
+import { PAID_EXPR } from "../services/commission.server";
 import { monthKey } from "../services/ids.server";
 import { getSettings } from "../services/settings.server";
 import { authenticate } from "../shopify.server";
@@ -53,7 +54,7 @@ export const loader = async ({ request }) => {
     WebhookEvent.countDocuments({ status: "failed" }),
     MonthlyPayout.aggregate([
       { $match: { status: { $ne: "Paid" }, month: { $lt: month } } },
-      { $group: { _id: null, total: { $sum: "$amount" }, rows: { $sum: 1 } } },
+      { $group: { _id: null, total: { $sum: { $subtract: ["$amount", PAID_EXPR] } }, rows: { $sum: 1 } } },
     ]),
     Order.aggregate([
       { $match: { tags: "rx", deletedAt: null, demo: { $ne: true }, orderCreatedAt: { $gte: monthStart } } },

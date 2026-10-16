@@ -14,7 +14,8 @@ import { getCustomer, gql, gqlAll, legacyId } from "./shopify-admin.server";
    Products), one document per Master Key, holding the same columns the
    "Products" sheet tab had. For every master:
      - a BASE product (tag rxbase:<key>, base-product) with no practice id
-     - one COPY per practice that has an active physician
+     - one COPY per practice, made as soon as the practice exists (the
+       Practice account, or any clinic / physician carrying its practice_id)
        (tags practice_id:<id> + rxcopy:<key>; copies made before carry
        rxmaster:<key> or rxbase:<key> and are re-tagged on their next sync)
    Details stay in step with the master on every run EXCEPT price, which is
@@ -958,8 +959,9 @@ const practiceTarget = (master, practiceId) => ({
 
 /**
  * Practices that should have product copies: every practice_id carried by a
- * wholesale customer who also has doctor_id + clinic_id. Read live from
- * Shopify (not the local mirror) because this decides what gets created.
+ * wholesale customer - the Practice account itself, or any clinic /
+ * physician under it. Read live from Shopify (not the local mirror) because
+ * this decides what gets created.
  */
 async function activePracticeIds() {
   const nodes = await gqlAll(
@@ -978,13 +980,13 @@ async function activePracticeIds() {
   for (const n of nodes) {
     const tags = n.tags || [];
     const practiceId = tagVal(tags, "practice_id:");
-    if (practiceId && tagVal(tags, "doctor_id:") && tagVal(tags, "clinic_id:")) ids.add(practiceId);
+    if (practiceId) ids.add(practiceId);
   }
   return [...ids];
 }
 
 /**
- * Practices that still have product copies but no active physician.
+ * Practices that still have product copies but no portal account left.
  * Their products are only DELETED when PRODUCT_SYNC_DELETE_ORPHANS is TRUE
  * and the practice has been missing on two runs in a row (Shopify's customer
  * search can briefly omit a customer right after a tag change).
@@ -1000,7 +1002,7 @@ async function handleOrphanPractices(active) {
     const seen = await state.findOne({ _id: key });
     if (!seen) {
       await state.updateOne({ _id: key }, { $set: { value: Date.now(), expiresAt: null } }, { upsert: true });
-      logEvent("sync", "product-sync", `practice ${practiceId} has no active physician - flagged, nothing deleted`);
+      logEvent("sync", "product-sync", `practice ${practiceId} has no portal account - flagged, nothing deleted`);
       continue;
     }
     if (!isTrue(cfg.PRODUCT_SYNC_DELETE_ORPHANS)) {
@@ -1017,31 +1019,31 @@ async function handleOrphanPractices(active) {
       await Product.deleteOne({ productId: p.productId });
     }
     await state.deleteOne({ _id: key });
-    logEvent("sync", "product-sync", `practice ${practiceId}: last physician removed - ${products.length} product copies deleted`);
+    logEvent("sync", "product-sync", `practice ${practiceId}: last account removed - ${products.length} product copies deleted`);
   }
   // a practice that came back is no longer flagged
   await state.deleteMany({ _id: { $in: active.map((id) => "orphan-practice:" + id) } });
   return out;
 }
 
-/* ------------------------- deleted last physician ------------------------ */
+/* -------------------------- deleted last account -------------------------- */
 
-/* Set when a practice's copies are deleted because its last physician was
-   deleted. Shopify's customer search keeps returning a deleted customer for
+/* Set when a practice's copies are deleted because its last portal account
+   was deleted. Shopify's customer search keeps returning a deleted customer for
    a while, so without this mark the next sync would see the practice as
    active again and re-create every copy. Cleared as soon as a real
-   physician is confirmed for the practice. */
+   account is confirmed for the practice. */
 const REMOVED_TTL = 6 * 3600;
 const removedKey = (practiceId) => "practice-removed:" + practiceId;
 
 /**
- * Does the practice still have a physician (doctor + clinic + practice id,
- * wholesale)? Candidates come from the local accounts AND Shopify's search,
+ * Does the practice still have a portal account (the Practice itself, or a
+ * clinic / physician under it - wholesale + practice_id)? Candidates come from the local accounts AND Shopify's search,
  * and each one is confirmed by a live read by id - the search alone lags
  * both ways (still lists a deleted customer, misses a brand-new one).
  * `except` = the customer being deleted. Throws when Shopify can't be read.
  */
-async function practiceHasPhysician(practiceId, except = "") {
+async function practiceHasAccount(practiceId, except = "") {
   const fromSearch = await gqlAll(
     `#graphql
     query RxPracticeCustomers($after: String, $q: String!) {
@@ -1056,7 +1058,7 @@ async function practiceHasPhysician(practiceId, except = "") {
     { max: 2000 },
   );
   const local = await Account.find(
-    { practiceId, doctorId: { $ne: "" }, clinicId: { $ne: "" } },
+    { practiceId, wholesale: true },
     { customerId: 1 },
   ).lean();
   const ids = new Set([...fromSearch.map((n) => String(n.legacyResourceId)), ...local.map((a) => a.customerId)]);
@@ -1065,18 +1067,18 @@ async function practiceHasPhysician(practiceId, except = "") {
     const c = await getCustomer(id);
     if (!c) continue;
     const t = idsFromCustomerTags(tagList(c.tags));
-    if (t.doctorId && t.clinicId && t.wholesale && t.practiceId === practiceId) return true;
+    if (t.wholesale && t.practiceId === practiceId) return true;
   }
   return false;
 }
 
-/** Copies of a removed practice must not be re-created - unless a physician
+/** Copies of a removed practice must not be re-created - unless an account
  *  has been added since, which also clears the mark. */
 async function blockedAsRemoved(practiceId) {
   if (!(await kvGet(removedKey(practiceId)))) return false;
   let has;
   try {
-    has = await practiceHasPhysician(practiceId);
+    has = await practiceHasAccount(practiceId);
   } catch {
     return true; // can't confirm -> don't re-create
   }
@@ -1088,7 +1090,7 @@ const removingCopies = new Map(); // practiceId -> running promise
 
 /**
  * A portal user was deleted: when that leaves the practice with no
- * physician, its product copies are deleted straight away (the timed
+ * portal account at all, its product copies are deleted straight away (the timed
  * orphan check would wait two runs and, by default, only report them).
  * Shared by the Delete button and the customers/delete webhook - a second
  * call for the same practice joins the first. Returns { deleted } or
@@ -1102,12 +1104,12 @@ export function removePracticeCopiesIfUnused(practiceId, { except = "" } = {}) {
     await connectDb();
     let has;
     try {
-      has = await practiceHasPhysician(practiceId, except);
+      has = await practiceHasAccount(practiceId, except);
     } catch (err) {
-      logEvent("error", "product-delete", `practice ${practiceId}: could not check its physicians - copies kept (${err.message || err})`, null, false);
-      return { kept: "could not check physicians" };
+      logEvent("error", "product-delete", `practice ${practiceId}: could not check its accounts - copies kept (${err.message || err})`, null, false);
+      return { kept: "could not check accounts" };
     }
-    if (has) return { kept: "practice still has a physician" };
+    if (has) return { kept: "practice still has an account" };
 
     // Mark first, so a sync running right now skips this practice from here on.
     await kvSet(removedKey(practiceId), Date.now(), REMOVED_TTL);
@@ -1119,7 +1121,7 @@ export function removePracticeCopiesIfUnused(practiceId, { except = "" } = {}) {
       .catch(() => {});
     await MasterProduct.updateMany({}, { $unset: { [`sigs.practice:${practiceId}`]: "" } });
     await mongoose.connection.db.collection("kv").deleteOne({ _id: "orphan-practice:" + practiceId });
-    logEvent("sync", "product-delete", `practice ${practiceId}: last physician deleted - ${deleted} product copies deleted`);
+    logEvent("sync", "product-delete", `practice ${practiceId}: last account deleted - ${deleted} product copies deleted`);
     return { deleted };
   })().finally(() => removingCopies.delete(practiceId));
   removingCopies.set(practiceId, run);
@@ -1248,7 +1250,7 @@ export function runProductSync() {
     const masters = await MasterProduct.find({}).lean();
     if (!masters.length) return { message: "No master products yet." };
 
-    // A practice whose last physician was just deleted can still show up in
+    // A practice whose last account was just deleted can still show up in
     // Shopify's lagging customer search - it must not get its copies back.
     const practices = [];
     for (const id of await activePracticeIds()) {
@@ -1267,7 +1269,7 @@ export function runProductSync() {
     for (const master of masters) await run(master, baseTarget(master));
     for (const practiceId of practices) {
       for (const master of masters) {
-        if (await kvGet(removedKey(practiceId))) break; // its last physician was deleted mid-run
+        if (await kvGet(removedKey(practiceId))) break; // its last account was deleted mid-run
         await run(master, practiceTarget(master, practiceId));
       }
     }
@@ -1279,7 +1281,7 @@ export function runProductSync() {
 }
 
 /**
- * Copies for ONE practice, run right after a physician is created so a new
+ * Copies for ONE practice, run right after a portal account is created so a new
  * practice doesn't wait for the next timed run (up to 30 minutes). Takes the
  * id directly instead of searching customers - that search can lag minutes
  * behind a just-created customer. Copies that already exist are updated or
@@ -1298,7 +1300,7 @@ export function syncPracticeCopies(practiceId) {
 /**
  * Is this practice's product set complete? done = not being created right
  * now AND every master's copy finished its sync. No masters = nothing to
- * create = done. The welcome email of a physician waits on this.
+ * create = done. The welcome email of a practice / clinic / physician waits on this.
  */
 export async function practiceCopiesStatus(practiceId) {
   await connectDb();
@@ -1324,8 +1326,8 @@ const copiesInProgress = new Set();
 export const practiceCopiesInProgress = () => [...copiesInProgress];
 
 /**
- * Gives a practice its product copies the moment it has a physician, from
- * wherever that physician came from (Accounts page, Shopify admin, the old
+ * Gives a practice its product copies the moment it exists - Practice,
+ * clinic or physician account, from wherever it came from (Accounts page, Shopify admin, the old
  * scripts, a re-sync). Skips a practice that already has copies - those are
  * kept current by the timed sync - or one already queued.
  */
@@ -1360,15 +1362,15 @@ function runPracticeCopies(practiceId) {
       logEvent("sync", "product-sync", `practice ${practiceId}: no master products yet - nothing to copy`, null, false);
       return { message: "No master products yet." };
     }
-    // Last physician deleted moments ago and this was triggered by a stale
-    // read of them -> no copies. A newly added physician clears the mark.
+    // Last account deleted moments ago and this was triggered by a stale
+    // read of it -> no copies. A newly added account clears the mark.
     if (await blockedAsRemoved(practiceId)) {
-      logEvent("sync", "product-sync", `practice ${practiceId}: no physician left (deleted) - copies not re-created`);
+      logEvent("sync", "product-sync", `practice ${practiceId}: no account left (deleted) - copies not re-created`);
       return { practiceId, skipped: "practice removed" };
     }
     const tally = { created: 0, updated: 0, unchanged: 0, skip: 0 };
     for (const master of masters) {
-      if (await kvGet(removedKey(practiceId))) break; // last physician deleted mid-run
+      if (await kvGet(removedKey(practiceId))) break; // last account deleted mid-run
       try {
         tally[await upsertFromMaster(master, practiceTarget(master, practiceId))]++;
       } catch (err) {
@@ -1377,7 +1379,7 @@ function runPracticeCopies(practiceId) {
       }
     }
     const result = { practiceId, masters: masters.length, ...tally };
-    logEvent("sync", "product-sync", `new physician - practice copies ${JSON.stringify(result)}`);
+    logEvent("sync", "product-sync", `new account - practice copies ${JSON.stringify(result)}`);
     return result;
   });
 }

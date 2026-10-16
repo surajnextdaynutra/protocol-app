@@ -10,6 +10,7 @@ export const WELCOME_DASHBOARDS = {
   "Clinic + Doctor": "/pages/rx-clinic-dashboard#getting-started",
   Physician: "/pages/rx-physician-dashboard#getting-started",
   "Sales Rep": "/pages/rx-sales-rep-dashboard#getting-started",
+  "Finance Admin": "/pages/shopify-admin",
   // the demo trio is emailed as its physician
   Demo: "/pages/rx-physician-dashboard#getting-started",
 };

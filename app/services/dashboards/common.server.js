@@ -1,5 +1,6 @@
 import { connectDb } from "../../db.server";
 import { MonthlyPayout, Order, Payout } from "../../models/index.server";
+import { payoutSplit } from "../commission.server";
 import { monthKey, parseAmount } from "../ids.server";
 import { getSettings } from "../settings.server";
 
@@ -218,51 +219,48 @@ const MONTHS = ["January", "February", "March", "April", "May", "June", "July", 
 const SHORT = MONTHS.map((m) => m.slice(0, 3));
 
 /**
- * Payment history for one (role, id), newest month first:
- *   [{ period: "August 2026", periodRange, key: "2026-08", status, amount,
- *      datePaid, transactionNum }]
- * status: "Open" = the current, still-running month; "Pending" = a finished
- * month not paid yet; "Paid". The current month is always present, even at $0.
+ * Payment history for one (role, id): one line per payout RECORD, newest
+ * month first (a month paid and then earning more has a Paid line and an
+ * Open / Pending line for the rest):
+ *   [{ period: "August 2026", periodRange, key: "2026-08", seq, status,
+ *      amount, paid, due, datePaid, transactionNum }]
+ * status: "Paid"; "Open" = an unpaid record of the current, still-running
+ * month; "Pending" = an unpaid record of a finished month. The current
+ * month is always present, even at $0.
  */
 export async function payoutHistory(role, entityId) {
   await connectDb();
   const cfg = await getSettings();
-  const rows = await MonthlyPayout.find({ role, entityId }).lean();
-  const byMonth = {};
-  for (const r of rows) {
-    const e = (byMonth[r.month] ||= { allPaid: true, amount: 0, datePaid: "", transactionNum: "" });
-    e.amount += Number(r.amount) || 0;
-    if (String(r.status || "Pending").trim().toLowerCase() !== "paid") {
-      e.allPaid = false;
-    } else {
-      e.datePaid = r.datePaid || e.datePaid;
-      e.transactionNum = r.transactionNo || e.transactionNum;
-    }
-  }
   const current = monthKey(new Date(), cfg.TIMEZONE);
-  byMonth[current] ||= { allPaid: false, amount: 0, datePaid: "", transactionNum: "" };
-
-  return Object.keys(byMonth)
-    .sort((a, b) => (a < b ? 1 : a > b ? -1 : 0))
-    .map((key) => {
-      const e = byMonth[key];
-      const [y, m] = key.split("-").map(Number);
-      let period = key;
-      let periodRange = key;
+  const rows = await MonthlyPayout.find({ role, entityId }).lean();
+  const lines = rows.map((r) => {
+    const s = payoutSplit(r);
+    return {
+      key: r.month,
+      seq: r.seq || 0,
+      status: s.paid > 0 ? "Paid" : r.month === current ? "Open" : "Pending",
+      amount: s.amount,
+      paid: s.paid,
+      due: s.due,
+      datePaid: s.paid > 0 ? r.datePaid || "" : "",
+      transactionNum: s.paid > 0 ? r.transactionNo || "" : "",
+    };
+  });
+  if (!lines.some((l) => l.key === current)) {
+    lines.push({ key: current, seq: 0, status: "Open", amount: 0, paid: 0, due: 0, datePaid: "", transactionNum: "", placeholder: true });
+  }
+  return lines
+    .sort((a, b) => (a.key < b.key ? 1 : a.key > b.key ? -1 : b.seq - a.seq))
+    .map((l) => {
+      const [y, m] = l.key.split("-").map(Number);
+      let period = l.key;
+      let periodRange = l.key;
       if (y && m) {
         const lastDay = new Date(y, m, 0).getDate();
         period = `${MONTHS[m - 1]} ${y}`;
         periodRange = `${SHORT[m - 1]} 1, ${y} - ${SHORT[m - 1]} ${lastDay}, ${y}`;
       }
-      return {
-        period,
-        periodRange,
-        key,
-        status: e.allPaid ? "Paid" : key === current ? "Open" : "Pending",
-        amount: e.amount,
-        datePaid: e.datePaid,
-        transactionNum: e.transactionNum,
-      };
+      return { period, periodRange, ...l };
     });
 }
 

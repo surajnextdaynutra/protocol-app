@@ -3,6 +3,7 @@
 client_id = "0d2395bac316aca4f9626a5fc9f5332b"
 name = "Protocol Therapeutics"
 application_url = "https://api.protocoltherapeutics.com"
+# application_url = "https://powerpoint-possession-dome-kent.trycloudflare.com"
 embedded = true
 
 [webhooks]
@@ -49,10 +50,13 @@ api_version = "2027-01"
 scopes = "read_all_orders,read_customers,read_files,read_inventory,read_locations,read_metaobject_definitions,read_metaobjects,read_orders,read_products,read_publications,read_purchase_options,write_app_proxy,write_customers,write_files,write_inventory,write_metaobjects,write_orders,write_products,write_publications,write_purchase_options"
 
 [auth]
+# redirect_urls = [ "https://powerpoint-possession-dome-kent.trycloudflare.com/auth/callback", "https://powerpoint-possession-dome-kent.trycloudflare.com/api/auth" ]
 redirect_urls = [ "https://api.protocoltherapeutics.com/auth/callback", "https://api.protocoltherapeutics.com/api/auth" ]
 
 [build]
+# automatically_update_urls_on_dev = true
 automatically_update_urls_on_dev = false
+
 
 # Storefront API: https://<store>/apps/rx/...  ->  <app>/proxy/...
 # Shopify signs each request and adds the logged-in customer's id.

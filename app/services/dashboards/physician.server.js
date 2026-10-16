@@ -225,8 +225,8 @@ export async function physicianDashboard({
   // is paid by the practice.
   if (doctor && isSolo) {
     out.payouts = await doctorPayouts(doctor);
-    out.payoutPaid = out.payouts.reduce((s, p) => s + (p.status === "Paid" ? p.amount : 0), 0);
-    out.payoutPending = out.payouts.reduce((s, p) => s + (p.status !== "Paid" ? p.amount : 0), 0);
+    out.payoutPaid = out.payouts.reduce((s, p) => s + (p.paid || 0), 0);
+    out.payoutPending = out.payouts.reduce((s, p) => s + (p.due || 0), 0);
   }
   if (pInfo) {
     out.solo = isSolo;
@@ -244,8 +244,7 @@ export async function physicianDashboard({
 export async function doctorPayouts(doctorId) {
   await connectDb();
   const cfg = await getSettings();
-  const history = await payoutHistory("Doctor", doctorId);
-  const byKey = Object.fromEntries(history.map((h) => [h.key, h]));
+  const history = await payoutHistory("Doctor", doctorId); // one line per payout record
 
   const orders = await Order.find(
     { "commission.logged": true, "commission.doctorId": doctorId },
@@ -258,25 +257,34 @@ export async function doctorPayouts(doctorId) {
     profitByMonth[key] = (profitByMonth[key] || 0) + c.doctorAmt + c.clinicAmt + c.practiceAmt;
   }
   const current = monthKey(new Date(), cfg.TIMEZONE);
+  // a month with no payout record yet shows its orders' total as owed
+  const owed = (key) => Math.round((profitByMonth[key] || 0) * 100) / 100;
+  const lines = history.map((h) => (h.placeholder ? { ...h, amount: owed(h.key), due: owed(h.key) } : h));
+  const months = new Set(history.map((h) => h.key));
   for (const key of Object.keys(profitByMonth)) {
-    if (!byKey[key]) {
-      const [y, m] = key.split("-").map(Number);
-      byKey[key] = {
-        period: new Date(y, m - 1, 1).toLocaleString("en-US", { month: "long", year: "numeric" }),
-        key,
-        status: key === current ? "Open" : "Pending",
-        datePaid: "",
-        transactionNum: "",
-      };
-    }
+    if (months.has(key)) continue;
+    const [y, m] = key.split("-").map(Number);
+    lines.push({
+      period: new Date(y, m - 1, 1).toLocaleString("en-US", { month: "long", year: "numeric" }),
+      key,
+      seq: 0,
+      status: key === current ? "Open" : "Pending",
+      amount: owed(key),
+      paid: 0,
+      due: owed(key),
+      datePaid: "",
+      transactionNum: "",
+    });
   }
-  return Object.values(byKey)
-    .sort((a, b) => (a.key < b.key ? 1 : a.key > b.key ? -1 : 0))
+  return lines
+    .sort((a, b) => (a.key < b.key ? 1 : a.key > b.key ? -1 : (b.seq || 0) - (a.seq || 0)))
     .map((h) => ({
       period: h.period,
       key: h.key,
       status: h.status,
-      amount: profitByMonth[h.key] || 0,
+      amount: h.amount,
+      paid: h.paid,
+      due: h.due,
       datePaid: h.datePaid,
       transactionNum: h.transactionNum,
     }));
