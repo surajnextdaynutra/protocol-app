@@ -8,6 +8,7 @@ import {
   Prescription,
   SalesRep,
 } from "../../models/index.server";
+import { payoutSplit, setPayoutRecordStatus } from "../commission.server";
 import { decryptJson } from "../crypto.server";
 import { demoIdSet } from "../ids.server";
 import { kvGet, kvSet } from "../log.server";
@@ -309,33 +310,39 @@ export async function financeDashboard(p) {
     if (role === "Doctor" && fPractice && doctorInfo[id]?.practiceId !== fPractice) continue;
     if (role === "Clinic" && fPractice && clinicPracticeId(id) !== fPractice) continue;
 
-    const isPaid = String(r.status || "Pending").trim().toLowerCase() === "paid";
+    // each payout record is all paid or all owed; commission logged after
+    // a month was paid sits on a new record of that month
+    const { paid, due } = payoutSplit(r);
     if (role !== "Rep") {
       commission.total += amount;
-      commission[isPaid ? "paid" : "pending"] += amount;
+      commission.paid += paid;
+      commission.pending += due;
     }
     const k = bucketKey[role];
     if (k) {
       commission[k + "Total"] += amount;
-      commission[k + (isPaid ? "Paid" : "Pending")] += amount;
+      commission[k + "Paid"] += paid;
+      commission[k + "Pending"] += due;
       const target =
         role === "Doctor" ? ensureDoc(id) : role === "Clinic" ? ensureClinic(id) : role === "Practice" ? ensurePrac(id) : ensureRep(id);
-      target[isPaid ? "paid" : "pending"] += amount;
+      target.paid += paid;
+      target.pending += due;
     }
     const name =
       role === "Doctor" ? doctorName(id) : role === "Clinic" ? clinicName(id) : role === "Practice" ? practiceName(id) : role === "Rep" ? repName(id) : id;
     payouts.push({
       month: r.month,
+      seq: r.seq || 0, // which record of that month - sent back on Mark paid / Undo
       role,
       id,
       name,
       amount,
-      status: isPaid ? "Paid" : "Pending",
+      status: paid > 0 ? "Paid" : "Pending",
       datePaid: r.datePaid || "",
       confirmationNum: r.transactionNo || "",
     });
   }
-  payouts.sort((a, b) => b.month.localeCompare(a.month));
+  payouts.sort((a, b) => b.month.localeCompare(a.month) || b.seq - a.seq);
 
   /* ---- banking ---- */
   const bankByType = { practice: {}, clinic: {}, rep: {}, physician: {} };
@@ -756,8 +763,9 @@ const normMonthKey = (v) => {
   return m ? `${m[1]}-${("0" + m[2]).slice(-2)}` : String(v || "").trim();
 };
 
-/** Flips Status / Date Paid / Transaction # on ONE existing payout row.
- *  Never creates a row, never touches the amount. */
+/** Mark paid / Undo on ONE payout record (`seq` picks the record of that
+ *  month; without it Paid = the open record, Pending = the latest paid
+ *  one). Undo puts the record's whole amount back to Pending. */
 export async function setPayoutStatus(body) {
   invalidateResponses();
   await connectDb();
@@ -768,21 +776,16 @@ export async function setPayoutStatus(body) {
   if (!month || !role || !id) return { ok: false, error: "month, role, and id are required" };
   if (status !== "Paid" && status !== "Pending") return { ok: false, error: "status must be Paid or Pending" };
 
-  const res = await MonthlyPayout.updateOne(
-    { month, role, entityId: id },
-    {
-      $set: {
-        status,
-        datePaid: status === "Paid" ? String(body.datePaid || "") : "",
-        transactionNo: status === "Paid" ? String(body.confirmationNum || "") : "",
-      },
-    },
-  );
-  if (!res.matchedCount) return { ok: false, error: `No payout row found for ${month} / ${role} / ${id}` };
+  const res = await setPayoutRecordStatus({ month, role, entityId: id, seq: body.seq }, status, {
+    datePaid: body.datePaid,
+    transactionNo: body.confirmationNum,
+  });
+  if (!res.ok) return { ok: false, error: `${res.error} (${month} / ${role} / ${id})` };
+  const row = res.row;
   const ackType = String(body.ackEntityType || "").trim();
   const ackId = String(body.ackEntityId || "").trim();
   if (status === "Paid" && ackType && ackId) await ackBankingChange(ackType, ackId);
-  return { ok: true, month, role, id, status };
+  return { ok: true, month, role, id, seq: row.seq || 0, status: row.status, amount: row.amount, merged: !!res.merged };
 }
 
 /**
@@ -807,17 +810,17 @@ export async function uploadPayoutsCsv(body) {
     if (status === "paid") status = "Paid";
     else if (status === "pending") status = "Pending";
     else continue;
-    const res = await MonthlyPayout.updateOne(
-      { month: period, role: new RegExp(`^${role}$`, "i"), entityId: id },
-      {
-        $set: {
-          status,
-          datePaid: status === "Paid" ? String(r.datePaid || "") : "",
-          transactionNo: status === "Paid" ? String(r.confirmationNum || "") : "",
-        },
-      },
-    );
-    rec.result = res.matchedCount ? "updated" : "not_found";
+    const row = await MonthlyPayout.findOne({ month: period, role: new RegExp(`^${role}$`, "i"), entityId: id }, { role: 1 }).lean();
+    if (!row) {
+      rec.result = "not_found";
+      continue;
+    }
+    // same as the Mark paid / Undo buttons; Seq (when the CSV has it) picks the record
+    const res = await setPayoutRecordStatus({ month: period, role: row.role, entityId: id, seq: r.seq }, status, {
+      datePaid: r.datePaid,
+      transactionNo: r.confirmationNum,
+    });
+    rec.result = res.ok ? "updated" : "not_found";
   }
   return { ok: true, results };
 }

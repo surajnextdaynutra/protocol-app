@@ -31,15 +31,23 @@ export const ROLES = [
   "Clinic",
   "Physician",
   "Sales Rep",
+  "Finance Admin",
   "Demo",
 ];
 
-// id prefix per kind (rep ids really are "RAP…").
-const PREFIX = { rep: "RAP", practice: "PRA", clinic: "CLN", doctor: "DOC" };
+// id prefix per kind (rep ids really are "RAP…"; finance admins carry admin_id:ADM…).
+const PREFIX = { rep: "RAP", practice: "PRA", clinic: "CLN", doctor: "DOC", admin: "ADM" };
 const ID_FIELD = { RAP: "repId", PRA: "practiceId", CLN: "clinicId", DOC: "doctorId" };
 
 /** Highest number already in use for a prefix, across accounts and reps. */
 async function highestExisting(prefix) {
+  if (prefix === "ADM") {
+    // admin ids have no field of their own - only the admin_id: tag
+    const tags = await Account.distinct("tags", { tags: /^admin_id:ADM\d+$/i });
+    return tags
+      .filter((t) => /^admin_id:ADM\d+$/i.test(t))
+      .reduce((max, t) => Math.max(max, Number(t.split(":")[1].trim().slice(3)) || 0), 0);
+  }
   const field = ID_FIELD[prefix];
   const values = [
     ...(await Account.distinct(field, { [field]: new RegExp("^" + prefix + "\\d+$", "i") })),
@@ -153,14 +161,14 @@ export async function assignToRep(repId, assignId) {
 /* ------------------------------ creation -------------------------------- */
 
 /**
- * A physician (doctor_id + clinic_id + practice_id) is what gives a practice
- * its own product copies. Start that copy run now, in the background, rather
+ * A practice gets its own product copies as soon as it exists - the Practice
+ * account itself, or a clinic / physician under it. Start that copy run now, in the background, rather
  * than leaving it to the next timed product sync - the admin's request
  * returns straight away either way.
  */
 function startPracticeCopies(tags) {
   const practiceId = tagVal(tags, "practice_id:");
-  if (!practiceId || !tagVal(tags, "doctor_id:") || !tagVal(tags, "clinic_id:")) return;
+  if (!practiceId) return;
   // upsertAccount usually queued it already - ensure skips a queued practice
   ensurePracticeCopies(practiceId).catch((err) =>
     logEvent("error", "product-sync", `practice ${practiceId} copies after account create: ${err}`, null, false),
@@ -178,6 +186,9 @@ async function buildTags(role, parent, reuse = {}) {
   switch (role) {
     case "Sales Rep":
       return [`rep_id:${await id("rep", "repId")}`, "wholesale_rep"];
+    // Finance dashboard (/pages/shopify-admin) needs BOTH tags
+    case "Finance Admin":
+      return [`admin_id:${await id("admin", "adminId")}`, "finance_admin"];
     case "Practice":
       return [`practice_id:${await id("practice", "practiceId")}`, "wholesale"];
     case "Clinic": {
@@ -209,8 +220,8 @@ async function buildTags(role, parent, reuse = {}) {
 /* --------------------------- re-adding a customer --------------------------- */
 
 // Tags the role decides - replaced when an existing customer is re-added.
-const ROLE_ID_TAG = /^(practice_id|clinic_id|doctor_id|rep_id|clinic_location):/i;
-const ROLE_FLAG_TAGS = ["wholesale", "wholesale_rep"];
+const ROLE_ID_TAG = /^(practice_id|clinic_id|doctor_id|rep_id|admin_id|clinic_location):/i;
+const ROLE_FLAG_TAGS = ["wholesale", "wholesale_rep", "finance_admin"];
 
 /**
  * Ids this customer OWNS, so re-adding them keeps their numbers. A doctor_id
@@ -220,7 +231,7 @@ const ROLE_FLAG_TAGS = ["wholesale", "wholesale_rep"];
  */
 async function ownedIds(customerId, tags, prevRole) {
   const ids = idsFromCustomerTags(tags);
-  const reuse = { repId: ids.repId, doctorId: ids.doctorId };
+  const reuse = { repId: ids.repId, doctorId: ids.doctorId, adminId: tagVal(tags, "admin_id:") };
   const others = { customerId: { $ne: String(customerId) } };
   if (ids.practiceId) {
     const owner = ["Practice", "Practice + Doctor"].includes(prevRole) ||
@@ -303,8 +314,16 @@ export async function createPortalAccount(input) {
     parent.practiceId = practice.id;
   }
 
-  // Optional free text shown on the storefront as the clinic name.
-  const clinicLocation = String(input.clinicLocation || "").trim();
+  // Optional free text shown on the storefront as the clinic name. A
+  // physician left blank takes their parent clinic's location.
+  let clinicLocation = String(input.clinicLocation || "").trim();
+  if (!clinicLocation && role === "Physician" && parent.clinicId) {
+    const clinicAcct = await Account.findOne(
+      { $or: [{ clinicId: parent.clinicId }, { clinicIds: parent.clinicId }], doctorId: "" },
+      { tags: 1 },
+    ).lean();
+    clinicLocation = tagVal(clinicAcct?.tags || [], "clinic_location:");
+  }
 
   // Already a Shopify customer (added before, or by the old scripts): update
   // it - and its database record - instead of failing or duplicating it.
@@ -434,7 +453,7 @@ async function createDemoTrio({ firstName, email }) {
    come from the live customer on every save and are never taken from the
    form, so editing can't change someone's role or ids by accident.
    clinic_location: has its own field. */
-const SYSTEM_TAG_PREFIX = /^(practice_id|clinic_id|doctor_id|rep_id|clinic_location):/i;
+const SYSTEM_TAG_PREFIX = /^(practice_id|clinic_id|doctor_id|rep_id|admin_id|clinic_location):/i;
 const SYSTEM_TAGS = ["wholesale", "wholesale_rep", "rx_demo", "finance_admin"];
 const isSystemTag = (t) => SYSTEM_TAG_PREFIX.test(t) || SYSTEM_TAGS.includes(String(t).trim().toLowerCase());
 
@@ -635,14 +654,14 @@ export async function deletePortalAccount(customerId) {
   logEvent("sync", acct?.email || customerId, `account deleted (${acct?.role || "?"})`, { customerId });
   const who = acct ? `${acct.first} ${acct.last}`.trim() || acct.email : customerId;
 
-  // Practice left without a physician -> its product copies go now, not on
+  // Practice left without any account -> its product copies go now, not on
   // the next timed run.
   let message = `Deleted ${who} from Shopify.`;
   if (acct?.practiceId) {
     const res = await removePracticeCopiesIfUnused(acct.practiceId, { except: customerId });
     if (res.deleted) {
       message = `Deleted ${who} and ${res.deleted} product${res.deleted === 1 ? "" : "s"} of practice ${acct.practiceId} from Shopify.`;
-    } else if (res.kept === "could not check physicians") {
+    } else if (res.kept === "could not check accounts") {
       message += ` Practice ${acct.practiceId}'s products were kept: Shopify could not be checked - see Sync & logs.`;
     }
   }
@@ -757,10 +776,10 @@ export async function sendDueWelcomeEmails() {
   let sent = 0;
   let waiting = 0;
   for (const a of due) {
-    // A physician's welcome waits until their practice's products exist, so
-    // they log in to a complete catalogue. Capped: never held more than
+    // A practice / clinic / physician welcome waits until the practice's
+    // products exist, so they log in to a complete catalogue. Capped: never held more than
     // WELCOME_WAIT_MAX_MS past the due time (e.g. a product keeps failing).
-    if (a.doctorId && a.clinicId && a.practiceId) {
+    if (a.practiceId) {
       const st = await practiceCopiesStatus(a.practiceId);
       if (!st.done) {
         const waitedMs = Date.now() - new Date(a.welcomeDueAt).getTime();

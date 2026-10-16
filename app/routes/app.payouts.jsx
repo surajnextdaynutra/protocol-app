@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Form, useActionData, useFetcher, useLoaderData, useSubmit } from "@remix-run/react";
 import {
+  Badge,
   BlockStack,
   Button,
   Card,
@@ -19,15 +20,17 @@ import { BankingRecord } from "../components/banking-record";
 import { connectDb } from "../db.server";
 import { Account, MonthlyPayout, SalesRep } from "../models/index.server";
 import { bankingForPayout } from "../services/banking.server";
-import { rebuildMonthlyPayouts } from "../services/commission.server";
-import { setPayoutStatus } from "../services/dashboards/finance.server";
+import { PAID_EXPR, rebuildMonthlyPayouts, setPayoutRecordStatus } from "../services/commission.server";
+import { invalidateResponses } from "../services/response-cache.server";
 import { logEvent } from "../services/log.server";
 import { auditDeletedOrders } from "../services/orders.server";
 import { authenticate } from "../shopify.server";
 
 /* Payouts - the "Monthly Payout Summary": one row per month / role / id.
-   Amounts are maintained by the order pipeline; finance only marks rows Paid
-   (with date + transaction #) or back to Pending. */
+   Amounts are maintained by the order pipeline; finance marks a record
+   Paid (with date + transaction #) or Undoes it. Commission logged after a
+   month was paid goes on a NEW record of that month, never on the paid one;
+   Undo puts the whole paid amount back to Pending. */
 
 async function nameMap() {
   const map = {};
@@ -58,16 +61,16 @@ export const loader = async ({ request }) => {
   if (q) filter.entityId = rx(q);
 
   const [rows, total, months, sums, names] = await Promise.all([
-    MonthlyPayout.find(filter).sort({ month: -1, role: 1, entityId: 1 }).skip(skip).limit(pageSize).lean(),
+    MonthlyPayout.find(filter).sort({ month: -1, role: 1, entityId: 1, seq: 1 }).skip(skip).limit(pageSize).lean(),
     MonthlyPayout.countDocuments(filter),
     MonthlyPayout.distinct("month"),
     MonthlyPayout.aggregate([
       { $match: filter },
-      { $group: { _id: { $cond: [{ $eq: ["$status", "Paid"] }, "paid", "pending"] }, total: { $sum: "$amount" } } },
+      { $group: { _id: null, amount: { $sum: "$amount" }, paid: { $sum: PAID_EXPR } } },
     ]),
     nameMap(),
   ]);
-  const sum = Object.fromEntries(sums.map((s) => [s._id, s.total]));
+  const sum = { paid: sums[0]?.paid || 0, pending: Math.max(0, (sums[0]?.amount || 0) - (sums[0]?.paid || 0)) };
   return {
     q, role, status, month, page, pageSize, total,
     months: months.sort().reverse(),
@@ -79,6 +82,7 @@ export const loader = async ({ request }) => {
       role: r.role,
       entityId: r.entityId,
       name: names[`${r.role}|${r.entityId}`] || "",
+      seq: r.seq || 0,
       amount: r.amount,
       status: r.status === "Paid" ? "Paid" : "Pending",
       datePaid: r.datePaid,
@@ -113,17 +117,20 @@ export const action = async ({ request }) => {
       .catch((err) => logEvent("error", "deleted-orders-audit", String(err), null, false));
     return { ok: true, message: "Checking every order against Shopify in the background - see Sync & logs for 'deleted-orders-audit'." };
   }
-  const res = await setPayoutStatus({
-    month: f.get("month"),
-    role: f.get("role"),
-    id: f.get("entityId"),
-    status: f.get("status"),
+  invalidateResponses();
+  const status = f.get("status") === "Paid" ? "Paid" : "Pending";
+  const res = await setPayoutRecordStatus({ rowId: String(f.get("rowId") || "") }, status, {
     datePaid: f.get("datePaid"),
-    confirmationNum: f.get("transactionNo"),
+    transactionNo: f.get("transactionNo"),
   });
-  return res.ok
-    ? { ok: true, message: `${res.role} ${res.id} - ${res.month} marked ${res.status}.` }
-    : { ok: false, message: res.error };
+  if (!res.ok) return { ok: false, message: res.error };
+  const r = res.row;
+  return {
+    ok: true,
+    message: status === "Paid"
+      ? `${r.role} ${r.entityId} - ${r.month}: ${money(r.amount)} marked Paid.`
+      : `${r.role} ${r.entityId} - ${r.month}: back to Pending - ${money(r.amount)} owed${res.merged ? " (joined with the newer unpaid commission)" : ""}.`,
+  };
 };
 
 export default function Payouts() {
@@ -151,7 +158,7 @@ export default function Payouts() {
 
   const save = (row, newStatus) => {
     submit(
-      { month: row.month, role: row.role, entityId: row.entityId, status: newStatus, datePaid, transactionNo },
+      { rowId: row.id, status: newStatus, datePaid, transactionNo },
       { method: "post" },
     );
     setPaying(null);
@@ -193,7 +200,8 @@ export default function Payouts() {
             columnContentTypes={["text", "text", "text", "text", "numeric", "text", "text", "text", "text"]}
             headings={["Month", "Role", "ID", "Name", "Amount", "Status", "Date paid", "Transaction #", ""]}
             rows={data.rows.map((r) => [
-              r.month, r.role, r.entityId, r.name, money(r.amount),
+              r.seq ? <InlineStack key={r.id + "m"} gap="100">{r.month}<Badge>{`#${r.seq + 1}`}</Badge></InlineStack> : r.month,
+              r.role, r.entityId, r.name, money(r.amount),
               <StatusBadge key={r.id} status={r.status} />,
               r.datePaid, r.transactionNo,
               <InlineStack key={r.id + "a"} gap="200" wrap={false} align="end">
@@ -220,6 +228,7 @@ export default function Payouts() {
         <Modal.Section>
           <BlockStack gap="300">
             <Text as="p">Amount: <b>{paying ? money(paying.amount) : ""}</b></Text>
+            <Text as="p" tone="subdued">Commission logged after this is marked paid goes on a new record for the same month.</Text>
             <TextField label="Date paid" type="date" value={datePaid} onChange={setDatePaid} autoComplete="off" />
             <TextField label="Transaction / confirmation #" value={transactionNo} onChange={setTransactionNo} autoComplete="off" />
           </BlockStack>

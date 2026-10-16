@@ -168,7 +168,11 @@ check("B is solo", b.commission.solo, true);
 check("B doctor gets the whole margin", b.commission.doctorAmt, 60);
 check("B practice amount", b.commission.practiceAmt, 0);
 
-const payout = async (role, id) => (await M.MonthlyPayout.findOne({ role, entityId: id }).lean())?.amount;
+// a month can hold several payout records - their total
+const payout = async (role, id) => {
+  const rows = await M.MonthlyPayout.find({ role, entityId: id }).lean();
+  return rows.length ? Math.round(rows.reduce((t, r) => t + r.amount, 0) * 100) / 100 : undefined;
+};
 check("payout: practice gets one combined row", await payout("Practice", "PRA1"), 120);
 check("payout: no separate doctor row inside a practice", await payout("Doctor", "DOC1"), undefined);
 check("payout: solo doctor", await payout("Doctor", "DOC9"), 60);
@@ -216,6 +220,48 @@ const month = (await M.MonthlyPayout.findOne({ role: "Practice" }).lean()).month
 check("finance: mark paid", (await setPayoutStatus({ month, role: "Practice", id: "PRA1", status: "Paid", datePaid: "2026-10-14", confirmationNum: "TX1" })).ok, true);
 check("practice sees it paid", (await practiceDashboard({ practice: "PRA1" })).commission.paid, 120);
 
+// Commission logged AFTER a month was paid opens a NEW record - the paid one stays exactly as paid.
+const { adjustMonthlyPayout, rebuildMonthlyPayouts, setPayoutRecordStatus } = await import("../app/services/commission.server.js");
+const prRows = async () => (await M.MonthlyPayout.find({ month, role: "Practice", entityId: "PRA1" }).sort({ seq: 1 }).lean())
+  .map((r) => `${r.status}:${r.amount}`).join(",");
+await adjustMonthlyPayout(month, "Practice", "PRA1", 5);
+check("paid month + new order: new record", await prRows(), "Paid:120,Pending:5");
+await adjustMonthlyPayout(month, "Practice", "PRA1", 2);
+check("next order joins the open record", await prRows(), "Paid:120,Pending:7");
+const pdAfter = await practiceDashboard({ practice: "PRA1" });
+check("practice: paid stays 120", pdAfter.commission.paid, 120);
+check("practice: only the new orders are owed", pdAfter.commission.open + pdAfter.commission.pending, 7);
+const fdAfter = await financeDashboard({});
+check("finance: owed = only the new orders", fdAfter.commission.practicePending, 7);
+check("finance: both records listed", fdAfter.payouts.filter((x) => x.id === "PRA1").map((x) => `${x.seq}:${x.status}:${x.amount}`).sort().join(","), "0:Paid:120,1:Pending:7");
+// the +5 / +2 above have no orders behind them: rebuild compares the month's records TOGETHER with the orders
+check("rebuild totals every record of a month", (await rebuildMonthlyPayouts({ dryRun: true })).changes.map((c) => `${c.entityId}:${c.from}->${c.to}`).join(","), "PRA1:127->120");
+// Undo = the whole paid amount back to Pending, in the month's one open record
+check("undo (finance page, by seq)", (await setPayoutStatus({ month, role: "Practice", id: "PRA1", status: "Pending", seq: 0 })).merged, true);
+check("undo: whole amount pending in one record", await prRows(), "Pending:127");
+check("mark paid closes the record", (await setPayoutStatus({ month, role: "Practice", id: "PRA1", status: "Paid", datePaid: "2026-10-20", confirmationNum: "TX2" })).status, "Paid");
+// an order refunded after payment comes off the next payment
+await adjustMonthlyPayout(month, "Practice", "PRA1", -7);
+check("refund after payment: deduction record", await prRows(), "Paid:127,Pending:-7");
+check("records still total the orders", await payout("Practice", "PRA1"), 120);
+const paidRec = await M.MonthlyPayout.findOne({ month, role: "Practice", entityId: "PRA1", status: "Paid" }).lean();
+check("undo (admin page, by record id)", (await setPayoutRecordStatus({ rowId: String(paidRec._id) }, "Pending")).merged, true);
+check("undo by id: net amount pending", await prRows(), "Pending:120");
+
+// Rep paid for the month, then another order the same month: Open = only the new order,
+// and the payment history has a line per record.
+check("rep month marked paid", (await setPayoutStatus({ month, role: "Rep", id: "RAP1", status: "Paid", datePaid: "2026-10-16", confirmationNum: "4567890" })).status, "Paid");
+const orderD = { ...orderA, id: 1004, name: "#1004", note_attributes: [{ name: "Doctor ID", value: "DOC1" }, { name: "Clinic ID", value: "CLN1" }, { name: "Practice ID", value: "PRA1" }],
+  line_items: [{ id: 4, product_id: 100, variant_id: 1, title: "Omega XP", quantity: 1, price: "100.00", properties: [] }] };
+await orders.processOrder(orderD, { source: "smoke" });
+const repRows = async () => (await M.MonthlyPayout.find({ month, role: "Rep", entityId: "RAP1" }).sort({ seq: 1 }).lean()).map((r) => `${r.status}:${r.amount}`).join(",");
+check("rep: new order after payment = new record", await repRows(), "Paid:2,Pending:1");
+const rdAfter = await repDashboard({ rep: "RAP1" });
+check("rep dashboard: open = only the new order", rdAfter.commission.open, 1);
+check("rep dashboard: paid stays 2", rdAfter.commission.paid, 2);
+check("rep dashboard: a history line per record", rdAfter.commission.payments.filter((p) => p.status !== "Paid" || p.amount === 2).map((p) => `${p.status}:${p.amount}`).join(","), "Paid:2,Open:1");
+await orders.processOrderDelete({ id: 1004 }); // back to order A only for the checks below
+
 /* ------------------------- signed App Proxy calls ----------------------- */
 function proxyRequest(resource, params, customerId, body) {
   const q = { ...params, shop: SHOP, path_prefix: "/apps/rx", timestamp: String(Math.floor(Date.now() / 1000)) };
@@ -232,6 +278,10 @@ check("proxy: other practice refused", (await call("practice", { action: "dashbo
 check("proxy: logged-out refused", (await call("practice", { action: "dashboard", practice: "PRA1" }, "")).ok, false);
 check("proxy: doctor sees own dashboard", (await call("physician", { action: "dashboard", doctor: "DOC1", practice: "PRA1" }, "902")).ok, true);
 check("proxy: doctor cannot see a colleague", (await call("physician", { action: "dashboard", doctor: "DOC2", practice: "PRA1" }, "902")).ok, false);
+check("proxy: doctor in a clinic sends own clinic id", (await call("physician", { action: "dashboard", doctor: "DOC1", clinic: "CLN1" }, "902")).ok, true);
+check("proxy: doctor cannot narrow by another clinic", (await call("physician", { action: "dashboard", doctor: "DOC1", clinic: "CLN9" }, "902")).ok, false);
+check("proxy: doctor cannot open the clinic's own figures", (await call("physician", { action: "dashboard", clinic: "CLN1" }, "902")).ok, false);
+check("proxy: practice master drills into doctor + clinic", (await call("physician", { action: "dashboard", doctor: "DOC1", clinic: "CLN1" }, "900")).ok, true);
 check("proxy: practice master may drill into its doctor", (await call("practice", { action: "dashboard", doctor: "DOC2" }, "900")).ok, true);
 check("proxy: doctor cannot open the practice dashboard", (await call("practice", { action: "dashboard", practice: "PRA1" }, "902")).ok, false);
 check("proxy: doctor cannot open the clinic dashboard", (await call("clinic", { action: "dashboard", clinic: "CLN1" }, "902")).ok, false);
@@ -247,6 +297,10 @@ check("proxy: doctor cannot write an Rx as a colleague", (await call("builder", 
 check("proxy: patient account cannot write an Rx", (await call("builder", {}, "501", { action: "confirm", rxId: "RX-11" })).ok, false);
 check("proxy: rep sees own", (await call("rep", { action: "repdash", rep: "RAP1" }, "950")).ok, true);
 check("proxy: finance refused for a rep", (await call("finance", { action: "admindash" }, "950")).ok, false);
+await M.Account.create({ customerId: "960", role: "Finance Admin", first: "Fin", last: "Admin", email: "fin@example.com", tags: ["admin_id:ADM1", "finance_admin"] });
+check("proxy: finance admin opens the finance dashboard", (await call("finance", { action: "admindash" }, "960")).ok, true);
+check("finance admin id continues from existing", await nextId("ADM"), "ADM2");
+check("finance admin role read from tags", (await import("../app/services/accounts.server.js")).roleFromTags(["admin_id:ADM1", "finance_admin"]), "Finance Admin");
 check("proxy: clinic name is public (storefront bar)", (await call("physician", { action: "clinicName", clinic: "CLN1" }, "")).clinicName, "North Clinic");
 check("proxy: physician list is public and has no email", (await (await handleProxy(proxyRequest("physicians", { action: "customers" }, ""), "physicians")).json()).some((c) => "email" in c), false);
 check("proxy: cart tracking is open", (await call("cart", {}, "", { action: "track", rxId: "RX-2", event: "opened" })).ok, true);
@@ -278,6 +332,45 @@ check("banking drops unknown keys", loaded.fields.not_allowed, undefined);
 check("id generator continues from existing ids", await nextId("PRA"), "PRA10");
 const imp = await importCsv("monthlyPayouts", "Month,Role,ID,Amount,Status,Date Paid,Transaction #\n2026-08,Practice,PRA7,\"$1,250.50\",Paid,2026-09-05,TX9\n2026-08,Practice,PRA7,49.50,Paid,,\n");
 check("csv import merges split months", imp.ok && (await payout("Practice", "PRA7")), 1300);
+
+/* -------------------- clinic / physician earnings ----------------------- */
+// Omega XP becomes PRA1's practice copy: defaults physician $10, clinic $5, wholesale $40
+await M.Product.updateOne({ productId: "100" }, { $set: { practiceId: "PRA1", masterKey: "Omega XP", "metafields.published": true } });
+const ed = await call("practice", { action: "earnings", productId: "gid://shopify/Product/100", fresh: "1" }, "900");
+check("earnings: practice opens the editor", ed.ok && ed.clinics.length, 1);
+check("earnings: clinic lists its physicians", ed.clinics[0]?.doctors.length, 2);
+check("earnings: physician cannot open it", (await call("practice", { action: "earnings", productId: "100" }, "902")).ok, false);
+check("earnings: clinic cannot save", (await call("practice", {}, "901", { action: "saveEarnings", productId: "100", entries: [] })).ok, false);
+check("earnings: another practice's physician refused", (await call("practice", {}, "900", { action: "saveEarnings", productId: "100", entries: [{ role: "physician", id: "DOC9", amount: 1 }] })).ok, false);
+const se = await call("practice", {}, "900", { action: "saveEarnings", productId: "100", entries: [
+  { role: "physician", id: "DOC1", amount: 12 }, { role: "physician", id: "DOC2", amount: "" }, { role: "clinic", id: "CLN1", amount: 7 },
+] });
+check("earnings: saved", se.ok && se.customEarnings, 2);
+
+const view = async (customerId, ids) => (await call("practice", { action: "products", fresh: "1", ...ids }, customerId)).products?.[0] || {};
+const asDoc1 = await view("902", { practice_id: "PRA1", clinic_id: "CLN1", doctor_id: "DOC1" });
+check("earnings: DOC1 sees own amount", asDoc1.physicianCommission, 12);
+check("earnings: DOC1 sees the clinic's amount", asDoc1.clinicCommission, 7);
+check("earnings: DOC2 keeps the default", (await view("903", { practice_id: "PRA1", clinic_id: "CLN1", doctor_id: "DOC2" })).physicianCommission, 10);
+const asClinic = await view("901", { practice_id: "PRA1", clinic_id: "CLN1" });
+check("earnings: clinic sees own amount", asClinic.clinicCommission, 7);
+check("earnings: clinic sees physician range low", asClinic.physicianMin, 10);
+check("earnings: clinic sees physician range high", asClinic.physicianMax, 12);
+const asPractice = await view("900", { practice_id: "PRA1" });
+check("earnings: practice sees the default", asPractice.physicianCommission, 10);
+check("earnings: practice sees the custom count", asPractice.customEarnings, 2);
+
+const { computeOrderCommission } = await import("../app/services/commission.server.js");
+const line = [{ productId: "100", quantity: 2, price: 100, title: "Omega XP" }]; // profit 120
+const s1 = await computeOrderCommission(line, { doctorId: "DOC1", clinicId: "CLN1", practiceId: "PRA1" });
+check("earnings split: DOC1 own rate", s1.doctorAmt, 24);
+check("earnings split: clinic own rate", s1.clinicAmt, 14);
+check("earnings split: practice remainder", s1.practiceAmt, 82);
+const s2 = await computeOrderCommission(line, { doctorId: "DOC2", clinicId: "CLN1", practiceId: "PRA1" });
+check("earnings split: DOC2 default rate", s2.doctorAmt, 20);
+check("earnings split: DOC2 practice remainder", s2.practiceAmt, 86);
+await call("practice", {}, "900", { action: "saveEarnings", productId: "100", entries: [{ role: "physician", id: "DOC1", amount: "" }] });
+check("earnings: blank goes back to the default", (await computeOrderCommission(line, { doctorId: "DOC1", clinicId: "CLN1", practiceId: "PRA1" })).doctorAmt, 20);
 
 /* ----------------------------- order deleted ---------------------------- */
 await orders.processOrderDelete({ id: 1001 });

@@ -45,17 +45,18 @@ export async function repAssignedPractices(repId) {
   return rep?.assignedPracticeIds || [];
 }
 
-/** Payment records for the rep, from the payout summary. */
+/** Payment records for the rep, from the payout summary - one row per
+ *  payout record (a month paid and then earning more has two). */
 async function repPayouts(repId) {
-  const out = { total: 0, paid: 0, pending: 0, rows: [] };
+  const out = { total: 0, paid: 0, pending: 0, currentMonthPaidAmount: 0, rows: [] };
   const cfg = await getSettings();
   const current = monthKey(new Date(), cfg.TIMEZONE);
   for (const h of await payoutHistory("Rep", repId)) {
     if (!(h.amount > 0)) continue;
     out.total += h.amount;
-    if (h.status === "Paid") out.paid += h.amount;
-    else out.pending += h.amount;
-    if (h.key === current && h.status === "Paid") out.currentMonthPaid = true;
+    out.paid += h.paid;
+    out.pending += h.due;
+    if (h.key === current) out.currentMonthPaidAmount += h.paid;
     const [y, m] = h.key.split("-").map(Number);
     const monthTs = y && m ? new Date(y, m - 1, 1).getTime() : 0;
     out.rows.push({
@@ -550,7 +551,9 @@ export async function repDashboard({
   out.orders = ordersArr.slice(0, 100);
 
   const pay = await repPayouts(rep);
-  const open = pay.currentMonthPaid ? 0 : commissionOpen;
+  // this month's commission not paid yet - a payment made mid-month covers
+  // only what was earned up to then
+  const open = Math.max(0, Math.round((commissionOpen - pay.currentMonthPaidAmount) * 100) / 100);
   out.commission.total = commissionAllTime;
   out.commission.paid = pay.paid;
   out.commission.open = open;

@@ -87,9 +87,10 @@ export const loader = async ({ request }) => {
   ]);
   const label = (a, id) => `${a.company || `${a.first} ${a.last}`.trim() || id} (${id})`;
 
-  // Product copies per physician's practice - created automatically when the
-  // physician is added; the page polls while any are still being created.
-  const pracIds = [...new Set(rows.filter((a) => a.doctorId && a.practiceId).map((a) => a.practiceId))];
+  // Product copies per practice - created automatically as soon as the
+  // practice (or a clinic / physician under it) is added; the page polls
+  // while any are still being created.
+  const pracIds = [...new Set(rows.filter((a) => a.practiceId).map((a) => a.practiceId))];
   const [copyCounts, masterCount] = await Promise.all([
     pracIds.length
       ? Product.aggregate([
@@ -117,9 +118,10 @@ export const loader = async ({ request }) => {
       name: `${a.first} ${a.last}`.trim(),
       company: a.company,
       email: a.email,
-      ids: [a.repId, a.practiceId, a.clinicId, a.doctorId].filter(Boolean).join(" · "),
-      // physicians only: "creating" | number of this practice's product copies
-      copies: a.doctorId && a.practiceId
+      ids: [a.repId, (a.tags || []).find((t) => /^admin_id:/i.test(t))?.split(":")[1]?.trim(), a.practiceId, a.clinicId, a.doctorId]
+        .filter(Boolean).join(" · "),
+      // practice / clinic / physician: "creating" | number of this practice's product copies
+      copies: a.practiceId
         ? creating.has(a.practiceId) ? "creating" : copies[a.practiceId] || 0
         : null,
       masterCount,
@@ -130,8 +132,8 @@ export const loader = async ({ request }) => {
         ? "Sent " + dateTime(a.welcomeEmailSentAt)
         : a.welcomeResult ||
           (a.welcomeDueAt
-            ? // a physician's welcome waits for their practice's products
-              a.doctorId && a.practiceId &&
+            ? // a practice / clinic / physician welcome waits for the practice's products
+              a.practiceId &&
               (creating.has(a.practiceId) || (masterCount && (copies[a.practiceId] || 0) < masterCount))
               ? "Waiting for products - sends when ready"
               : "Due " + dateTime(a.welcomeDueAt)
@@ -198,7 +200,7 @@ function CreateForm({ data, busy, onBulk }) {
   const needsPractice = v.role === "Clinic";
   const optionalPractice = v.role === "Master Clinic";
   const needsClinic = v.role === "Physician";
-  const takesRep = !["Sales Rep", "Demo"].includes(v.role);
+  const takesRep = !["Sales Rep", "Finance Admin", "Demo"].includes(v.role);
 
   return (
     <Card>
@@ -227,9 +229,11 @@ function CreateForm({ data, busy, onBulk }) {
               <Select label="Sales representative (optional)" name="repId" value={v.repId} onChange={set("repId")}
                 options={[{ label: "None", value: "" }, ...data.repOptions]} />
             ) : null}
-            {v.role !== "Sales Rep" && v.role !== "Demo" ? (
+            {!["Sales Rep", "Finance Admin", "Demo"].includes(v.role) ? (
               <TextField label="Clinic location (optional)" name="clinicLocation" value={v.clinicLocation} onChange={set("clinicLocation")}
-                helpText="Shown on the storefront as the clinic name." autoComplete="off" />
+                helpText={v.role === "Physician"
+                  ? "Shown on the storefront as the clinic name. Leave blank to use the parent clinic's location."
+                  : "Shown on the storefront as the clinic name."} autoComplete="off" />
             ) : null}
           </FormLayout.Group>
           {v.role !== "Demo" ? (
@@ -559,7 +563,7 @@ function DeleteModal({ row, onClose }) {
             store. They lose portal access straight away. This can't be undone.
           </Text>
           <Text as="p">
-            If this leaves their practice with no physician, that practice's product copies are deleted from the
+            If this leaves their practice with no account at all, that practice's product copies are deleted from the
             store at the same time.
           </Text>
           <Text as="p" tone="subdued">
@@ -582,7 +586,7 @@ export default function Accounts() {
   const [deleting, setDeleting] = useState(null);
   const [bulkOpen, setBulkOpen] = useState(false);
 
-  // While any physician's product copies are being created, refresh the list
+  // While any practice's product copies are being created, refresh the list
   // every few seconds so the count appears without clicking anything.
   const revalidator = useRevalidator();
   // ...and while a welcome email is waiting for those products, so "Sent" appears by itself

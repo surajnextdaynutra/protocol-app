@@ -19,7 +19,7 @@ export const ABANDONED_SMS_BODY_DEFAULT =
   "Hi [First Name], it looks like you have not completed your payment for your protocol from Dr. [Last Name]. Pick up where you left off here: [View Your Protocol]";
 
 export const ORDER_PAID_BODY_DEFAULT =
-  "Hi [name], We’ve received your Protocol Therapeutics order ([order-number]) and our team is preparing it for shipment. We’ll send another message with tracking information once it ships.";
+  "Hi [name], We've received your Protocol Therapeutics order ([order-number]) and our team is preparing it for shipment. We'll send another message with tracking information once it ships.";
 
 /* Order confirmation email, in the same layout as the protocol emails.
    [items] is filled with one table row per product (image, name, qty,

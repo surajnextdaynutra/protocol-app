@@ -1,6 +1,7 @@
 import { connectDb } from "../db.server";
 import { Product } from "../models/index.server";
 import { ApiError, canSeeClinic, canSeeDoctor, canSeePractice } from "./caller.server";
+import { applyViewerEarnings, productKey } from "./earnings.server";
 import { copyMasterKey, tagVal } from "./ids.server";
 import { logEvent } from "./log.server";
 import { escQ, gid, gql, gqlAll, legacyId, metafieldsSet } from "./shopify-admin.server";
@@ -209,8 +210,12 @@ async function ensureMirror() {
  * per-doctor copies. Only ACTIVE + published products are listed - what a
  * patient could actually buy right now. Price shown is custom.patient_price,
  * falling back to MSRP Low, then the variant price.
+ *
+ * `viewer` = { doctorId, clinicId } of the physician / clinic looking (both
+ * blank = the practice): the earnings columns are then THEIR amounts - see
+ * earnings.server.js applyViewerEarnings.
  */
-export async function listPracticeProducts(doctorId, clinicId, practiceId) {
+export async function listPracticeProducts(doctorId, clinicId, practiceId, viewer = {}) {
   doctorId = String(doctorId || "").trim();
   clinicId = String(clinicId || "").trim();
   practiceId = String(practiceId || "").trim();
@@ -245,8 +250,15 @@ export async function listPracticeProducts(doctorId, clinicId, practiceId) {
       status: String(p.status || "").toLowerCase(),
       description: m.description || "",
       keywords: m.keywords || "",
+      _key: productKey(p),
+      _practiceId: p.practiceId || "",
     };
   });
+  await applyViewerEarnings(products, viewer);
+  for (const p of products) {
+    delete p._key;
+    delete p._practiceId;
+  }
   return {
     ok: true,
     matchedBy: practiceId ? "practice_id" : clinicId ? "clinic_id" : "doctor_id",

@@ -6,7 +6,8 @@ import {
   Product,
   SalesRep,
 } from "../models/index.server";
-import { isDemoIds, monthKey } from "./ids.server";
+import { overridesFor, productKey } from "./earnings.server";
+import { copyMasterKey, isDemoIds, monthKey } from "./ids.server";
 import { logEvent } from "./log.server";
 import { getSettings } from "./settings.server";
 import { escQ, gid, gql, legacyId, metafieldsSet, mfNum } from "./shopify-admin.server";
@@ -110,9 +111,11 @@ export async function isSoloPractice(practiceId) {
   }
 }
 
-/** { productId: {wholesale, physician, clinic} } - local catalogue first,
- *  Shopify for anything not synced yet. Note the metafield key really is
- *  spelled "wholsale_price" in the store. */
+/** { productId: {wholesale, physician, clinic, key} } - local catalogue
+ *  first, Shopify for anything not synced yet. physician / clinic are the
+ *  product's DEFAULT earnings; `key` finds a clinic's / physician's own
+ *  (earnings.server.js). Note the metafield key really is spelled
+ *  "wholsale_price" in the store. */
 export async function commissionRates(productIds) {
   const map = {};
   const ids = [...new Set(productIds.map(String).filter(Boolean))];
@@ -120,13 +123,14 @@ export async function commissionRates(productIds) {
   await connectDb();
   const local = await Product.find(
     { productId: { $in: ids } },
-    { productId: 1, wholesale: 1, physicianCommission: 1, clinicCommission: 1 },
+    { productId: 1, wholesale: 1, physicianCommission: 1, clinicCommission: 1, masterKey: 1 },
   ).lean();
   for (const p of local) {
     map[p.productId] = {
       wholesale: p.wholesale || 0,
       physician: p.physicianCommission || 0,
       clinic: p.clinicCommission || 0,
+      key: productKey(p),
     };
   }
   const missing = ids.filter((id) => !map[id]);
@@ -138,6 +142,7 @@ export async function commissionRates(productIds) {
           nodes(ids: $ids) {
             ... on Product {
               id
+              tags
               wholesaleMf: metafield(namespace: "custom", key: "wholsale_price") { value type }
               physicianMf: metafield(namespace: "custom", key: "physician_commission") { value type }
               clinicMf: metafield(namespace: "custom", key: "clinic_commission") { value type }
@@ -152,6 +157,7 @@ export async function commissionRates(productIds) {
           wholesale: mfNum(n.wholesaleMf),
           physician: mfNum(n.physicianMf),
           clinic: mfNum(n.clinicMf),
+          key: productKey({ productId: n.id, masterKey: copyMasterKey(n.tags || []) }),
         };
       }
     } catch (err) {
@@ -164,7 +170,9 @@ export async function commissionRates(productIds) {
 /**
  * The Doctor / Clinic / Practice $ split for one order, line by line:
  *   lineProfit = max(0, (sell - wholesale) * qty)
- *   Doctor / Clinic = their fixed $/unit product rate * qty
+ *   Doctor / Clinic = their fixed $/unit product rate * qty - the practice's
+ *     own amount for that physician / clinic when it set one, else the
+ *     product's default
  *   Practice = whatever is left of lineProfit (never negative)
  * SOLO doctor: the doctor gets the full lineProfit.
  * Rep $ is a separate flat rate * total units.
@@ -183,6 +191,9 @@ export async function computeOrderCommission(lineItems, ids) {
   const rates = await commissionRates(lineItems.map((li) => li.productId));
   const solo =
     !clinicId && !!doctorId && !!practiceId && (await isSoloPractice(practiceId));
+  const own = solo
+    ? {}
+    : await overridesFor(practiceId, { doctorId, clinicId }, Object.values(rates).map((r) => r.key));
 
   let doctorAmt = 0;
   let clinicAmt = 0;
@@ -201,8 +212,9 @@ export async function computeOrderCommission(lineItems, ids) {
       c = 0;
       p = 0;
     } else {
-      d = (mf.physician || 0) * qty;
-      c = (mf.clinic || 0) * qty;
+      const o = own[mf.key] || {};
+      d = (o.physician ?? mf.physician ?? 0) * qty;
+      c = (o.clinic ?? mf.clinic ?? 0) * qty;
       p = Math.max(0, lineProfit - d - c);
     }
     doctorAmt += d;
@@ -243,28 +255,111 @@ const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
 /* ------------------------- monthly payout summary ----------------------- */
 
-/** Adds (or, with a negative delta, subtracts) on top of what is already
- *  logged for (month, role, id). Never touches Status / Date Paid /
- *  Transaction # - those are the finance admin's. A decrement never creates
- *  a row. */
+/* Payout RECORDS per (month, role, id), numbered by `seq`. At most one is
+   open (Pending) and new commission is added to it. Mark paid closes that
+   record exactly as it stood; commission logged afterwards opens a NEW
+   record instead of landing on the paid one (the Apps Script added it to
+   the paid row, so new commission looked paid). Undo puts a paid record's
+   whole amount back into the open one. */
+
+/** { amount, paid, due } of one payout record - all paid or all due. */
+export function payoutSplit(r) {
+  const amount = round2(r?.amount);
+  const isPaid = String(r?.status || "").trim().toLowerCase() === "paid";
+  return { amount, paid: isPaid ? amount : 0, due: isPaid ? 0 : amount };
+}
+
+/** Mongo expression for payoutSplit's `paid` (aggregations). */
+export const PAID_EXPR = { $cond: [{ $eq: ["$status", "Paid"] }, "$amount", 0] };
+
+/* The old unique (month, role, id) index allowed one row per month - it is
+   replaced once by (month, role, id, seq). */
+let payoutIndexes = null;
+export function ensurePayoutIndexes() {
+  payoutIndexes ||= (async () => {
+    await connectDb();
+    // Explicit, not MonthlyPayout.createIndexes(): a model compiled from an
+    // older schema would put the one-row-per-month index straight back.
+    const coll = MonthlyPayout.collection;
+    await coll.createIndex({ month: 1, role: 1, entityId: 1, seq: 1 }, { unique: true });
+    const idx = await coll.indexes().catch(() => []);
+    const old = idx.find((i) => i.unique && i.name === "month_1_role_1_entityId_1");
+    if (old) await coll.dropIndex(old.name);
+  })().catch((err) => {
+    payoutIndexes = null;
+    throw err;
+  });
+  return payoutIndexes;
+}
+
+const OPEN = { status: { $ne: "Paid" } };
+
+/** Adds `delta` to the open record of (month, role, id), creating it (next
+ *  seq) when every record there is paid. A negative delta (order deleted /
+ *  refunded) comes off the open record - below zero when the money was
+ *  already paid out, i.e. a deduction from the next payment. A decrement
+ *  with no record at all is only logged. */
 export async function adjustMonthlyPayout(month, role, entityId, delta) {
   if (!delta || !entityId) return;
-  await connectDb();
-  if (delta > 0) {
-    await MonthlyPayout.updateOne(
-      { month, role, entityId },
-      { $inc: { amount: round2(delta) }, $setOnInsert: { status: "Pending" } },
-      { upsert: true },
-    );
-  } else {
-    const res = await MonthlyPayout.updateOne(
-      { month, role, entityId },
-      { $inc: { amount: round2(delta) } },
-    );
-    if (!res.matchedCount) {
+  await ensurePayoutIndexes();
+  const key = { month, role, entityId };
+  const amt = round2(delta);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await MonthlyPayout.updateOne({ ...key, ...OPEN }, { $inc: { amount: amt } });
+    if (res.matchedCount) return;
+    const last = await MonthlyPayout.findOne(key, { seq: 1 }).sort({ seq: -1 }).lean();
+    if (!last && delta < 0) {
       logEvent("job", `${month}/${role}/${entityId}`, "payout decrement: no matching row");
+      return;
+    }
+    try {
+      await MonthlyPayout.create({ ...key, seq: last ? (last.seq || 0) + 1 : 0, amount: amt, status: "Pending" });
+      return;
+    } catch (err) {
+      if (err?.code !== 11000) throw err; // another order opened it at the same moment - add to that one
     }
   }
+  throw new Error(`payout ${month}/${role}/${entityId}: could not record ${amt}`);
+}
+
+/**
+ * Mark paid / Undo on ONE payout record: `{ rowId }`, or `{ month, role,
+ * entityId, seq? }` (Paid -> the open record; Pending -> that seq, else the
+ * latest paid one). Paid closes the record as it stands. Pending moves its
+ * whole amount back into the open record. Returns
+ * { ok, row } / { ok: false, error }.
+ */
+export async function setPayoutRecordStatus(target, status, { datePaid = "", transactionNo = "" } = {}) {
+  await ensurePayoutIndexes();
+  const byId = target.rowId ? { _id: target.rowId } : null;
+  const key = byId ? null : { month: target.month, role: target.role, entityId: target.entityId };
+  const hasSeq = target.seq !== undefined && target.seq !== null && target.seq !== "";
+  if (status === "Paid") {
+    const row = byId
+      ? await MonthlyPayout.findOne(byId).lean()
+      : await MonthlyPayout.findOne({ ...key, ...OPEN }).lean();
+    if (!row) return { ok: false, error: "No unpaid payout record found." };
+    if (row.status === "Paid") return { ok: true, row };
+    await MonthlyPayout.updateOne(
+      { _id: row._id },
+      { $set: { status: "Paid", datePaid: String(datePaid || ""), transactionNo: String(transactionNo || ""), paidAt: new Date() } },
+    );
+    return { ok: true, row: await MonthlyPayout.findById(row._id).lean() };
+  }
+  const row = byId
+    ? await MonthlyPayout.findOne(byId).lean()
+    : await MonthlyPayout.findOne({ ...key, status: "Paid", ...(hasSeq ? { seq: Number(target.seq) || 0 } : {}) }).sort({ seq: -1 }).lean();
+  if (!row) return { ok: false, error: "No paid payout record found." };
+  if (row.status !== "Paid") return { ok: true, row };
+  const open = await MonthlyPayout.findOne({ month: row.month, role: row.role, entityId: row.entityId, ...OPEN }).lean();
+  if (open) {
+    // one open record per month: the undone amount joins it
+    await MonthlyPayout.updateOne({ _id: open._id }, { $inc: { amount: round2(row.amount) } });
+    await MonthlyPayout.deleteOne({ _id: row._id });
+    return { ok: true, row: await MonthlyPayout.findById(open._id).lean(), merged: true };
+  }
+  await MonthlyPayout.updateOne({ _id: row._id }, { $set: { status: "Pending", datePaid: "", transactionNo: "", paidAt: null } });
+  return { ok: true, row: await MonthlyPayout.findById(row._id).lean() };
 }
 
 /** Applies one split to the payout summary. `sign` -1 reverses it. */
@@ -440,32 +535,27 @@ export async function rebuildMonthlyPayouts({ dryRun = true } = {}) {
     if (c.repId && c.repAmt > 0) add(c.month, "Rep", c.repId, c.repAmt);
   }
 
-  const existing = await MonthlyPayout.find({}, { month: 1, role: 1, entityId: 1, amount: 1, status: 1 }).lean();
-  const changes = [];
-  const seen = new Set();
+  // a month can hold several records (paid ones + the open one): compare
+  // their total, and put any difference on the open record
+  const existing = await MonthlyPayout.find({}, { month: 1, role: 1, entityId: 1, amount: 1 }).lean();
+  const have = new Map();
   for (const row of existing) {
     const k = `${row.month}|${row.role}|${row.entityId}`;
-    seen.add(k);
-    const want = round2(totals.get(k) || 0);
-    if (Math.abs(want - round2(row.amount || 0)) > 0.004) {
-      changes.push({ month: row.month, role: row.role, entityId: row.entityId, from: round2(row.amount || 0), to: want, status: row.status });
-    }
+    have.set(k, (have.get(k) || 0) + (Number(row.amount) || 0));
   }
-  for (const [k, amt] of totals) {
-    if (seen.has(k)) continue;
+  const changes = [];
+  for (const k of new Set([...have.keys(), ...totals.keys()])) {
+    const want = round2(totals.get(k) || 0);
+    const from = have.has(k) ? round2(have.get(k)) : null;
+    if (from !== null && Math.abs(want - from) <= 0.004) continue;
+    if (from === null && !want) continue;
     const [month, role, entityId] = k.split("|");
-    changes.push({ month, role, entityId, from: null, to: round2(amt), status: "Pending" });
+    changes.push({ month, role, entityId, from, to: want });
   }
 
   if (!dryRun) {
-    for (const ch of changes) {
-      await MonthlyPayout.updateOne(
-        { month: ch.month, role: ch.role, entityId: ch.entityId },
-        { $set: { amount: ch.to }, $setOnInsert: { status: "Pending" } },
-        { upsert: true },
-      );
-    }
-    logEvent("job", "payout-rebuild", `rebuilt from ${orders.length} orders - ${changes.length} row(s) corrected`);
+    for (const ch of changes) await adjustMonthlyPayout(ch.month, ch.role, ch.entityId, round2(ch.to - (ch.from || 0)));
+    logEvent("job", "payout-rebuild", `rebuilt from ${orders.length} orders - ${changes.length} month(s) corrected`);
   }
   return {
     dryRun,

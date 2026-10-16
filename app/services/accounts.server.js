@@ -15,6 +15,7 @@ import { invalidateResponses } from "./response-cache.server";
  *  doctor_id; a Practice Master has practice_id alone. */
 export function roleFromTags(tags) {
   const ids = idsFromCustomerTags(tags);
+  if (ids.finance) return "Finance Admin";
   if (ids.repId || hasTag(tags, "wholesale_rep")) return "Sales Rep";
   if (ids.doctorId) return "Physician";
   if (ids.clinicId) return "Clinic";
@@ -69,11 +70,12 @@ export async function upsertAccount(c) {
   if (existing?.provisionedAt && existing.role) doc.role = existing.role;
   await Account.updateOne({ customerId }, { $set: doc }, { upsert: true });
 
-  // A physician (doctor + clinic + practice id, wholesale) gives their practice
-  // its product copies - straight away, however the physician was added
-  // (Accounts page, Shopify admin, the old scripts, a re-sync). A practice
-  // that already has copies is skipped, so this is cheap on every update.
-  if (ids.doctorId && ids.clinicId && ids.practiceId && ids.wholesale) {
+  // Any portal account with a practice_id (the Practice itself, or a clinic /
+  // physician under it) gives that practice its product copies - straight
+  // away, however it was added (Accounts page, Shopify admin, the old
+  // scripts, a re-sync). A practice that already has copies is skipped, so
+  // this is cheap on every update.
+  if (ids.practiceId && ids.wholesale) {
     import("./catalog.server.js")
       .then((m) => m.ensurePracticeCopies(ids.practiceId))
       .catch((err) => logEvent("error", "product-sync", `practice ${ids.practiceId} copies: ${err}`, null, false));
@@ -142,7 +144,7 @@ export async function refreshAccountFromWebhook(payload) {
 
 /**
  * Drops a deleted customer's account. When that leaves its practice with no
- * physician, the practice's product copies are deleted straight away
+ * portal account at all, the practice's product copies are deleted straight away
  * (`cleanupProducts: false` = the caller does that itself and waits for it).
  * Returns the removed account, or null.
  */

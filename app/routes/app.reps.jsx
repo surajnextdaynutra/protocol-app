@@ -15,6 +15,7 @@ import {
 import { ActionResult, money, useBusy } from "../components/admin";
 import { connectDb } from "../db.server";
 import { Account, MonthlyPayout, SalesRep } from "../models/index.server";
+import { PAID_EXPR } from "../services/commission.server";
 import { authenticate } from "../shopify.server";
 
 /* Sales reps - replaces the "Sales Reps" tab. The practices (or practice-less
@@ -28,14 +29,13 @@ export const loader = async ({ request }) => {
     SalesRep.find({}).sort({ name: 1 }).lean(),
     MonthlyPayout.aggregate([
       { $match: { role: "Rep" } },
-      { $group: { _id: { id: "$entityId", paid: { $eq: ["$status", "Paid"] } }, total: { $sum: "$amount" } } },
+      { $group: { _id: "$entityId", amount: { $sum: "$amount" }, paid: { $sum: PAID_EXPR } } },
     ]),
     Account.find({ practiceId: { $ne: "" } }, { practiceId: 1, company: 1, first: 1, last: 1, doctorId: 1, clinicId: 1 }).lean(),
   ]);
   const totals = {};
   for (const o of owed) {
-    const t = (totals[o._id.id] ||= { paid: 0, pending: 0 });
-    t[o._id.paid ? "paid" : "pending"] += o.total;
+    totals[o._id] = { paid: o.paid, pending: Math.max(0, o.amount - o.paid) };
   }
   const practiceNames = {};
   for (const a of practices) {

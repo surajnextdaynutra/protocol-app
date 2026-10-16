@@ -33,6 +33,7 @@ import {
   practiceInfo,
   practiceStructure,
 } from "../services/directory.server";
+import { productEarnings, saveProductEarnings } from "../services/earnings.server";
 import { saveContact, saveReferral } from "../services/forms.server";
 import { connectDb } from "../db.server";
 import { Account } from "../models/index.server";
@@ -146,7 +147,21 @@ const practice = {
       (!practiceId && clinicId && isOwnId(caller, "clinic", clinicId)) ||
       (!practiceId && !clinicId && doctorId && isOwnId(caller, "doctor", doctorId));
     if (!ok) throw new ApiError("You do not have access to these products.", 403);
-    return listPracticeProducts(doctorId, clinicId, practiceId);
+    // whose earnings the table shows: this physician, else this clinic, else the practice's defaults
+    const viewer = {
+      doctorId: doctorId && isOwnId(caller, "doctor", doctorId) ? doctorId : "",
+      clinicId: clinicId && isOwnId(caller, "clinic", clinicId) ? clinicId : "",
+    };
+    return listPracticeProducts(doctorId, clinicId, practiceId, viewer);
+  },
+  // Product Pricing Management -> one product's clinic / physician earnings
+  earnings: ({ p, caller }) => {
+    requireLogin(caller);
+    return productEarnings(caller, String(p.productId || "").trim());
+  },
+  saveEarnings: ({ p, caller }) => {
+    requireLogin(caller);
+    return saveProductEarnings(caller, String(p.productId || "").trim(), p.entries);
   },
   practiceInfo: async ({ p, caller }) => {
     const id = String(p.practice || "").trim();
@@ -216,19 +231,35 @@ const account = {
 };
 
 /* --------------------------- physician dashboard ------------------------ */
+/**
+ * Access for the physician dashboard. With a doctor id the figures are that
+ * doctor's own and a clinic id only narrows them - so the clinic just has to
+ * be that doctor's clinic (a physician inside a clinic may not see the
+ * clinic's own figures, but does send its id). Without one, the clinic's
+ * figures need clinic-level access.
+ */
+async function requirePhysicianScope(caller, doctorId, clinicId) {
+  if (!doctorId) {
+    await requireScope(caller, { clinics: clinicId ? [clinicId] : [] }, belongs);
+    return;
+  }
+  await requireScope(caller, { doctors: [doctorId] }, belongs);
+  if (clinicId && !isOwnId(caller, "clinic", clinicId) && !(await belongs(clinicId, "clinic-doctor", doctorId))) {
+    throw new ApiError("You do not have access to this clinic.", 403);
+  }
+}
+
 const physician = {
   ping: ping("rx-physician"),
   dashboard: async ({ p, caller }) => {
-    const clinicId = String(p.clinic || "").trim();
-    const doctorId = String(p.doctor || "").trim();
-    await requireScope(caller, { clinics: clinicId ? [clinicId] : [], doctors: doctorId ? [doctorId] : [] }, belongs);
+    await requirePhysicianScope(caller, String(p.doctor || "").trim(), String(p.clinic || "").trim());
     return physicianDashboard(p);
   },
   sendLink: async ({ p, caller }) => {
     const clinicId = String(p.clinic || "").trim();
     const doctorId = String(p.doctor || "").trim();
     if (!clinicId && !doctorId) return { ok: false, error: "missing clinic or doctor id" };
-    await requireScope(caller, { clinics: clinicId ? [clinicId] : [], doctors: doctorId ? [doctorId] : [] }, belongs);
+    await requirePhysicianScope(caller, doctorId, clinicId);
     return sendCheckoutLink(p.rxId, doctorId, clinicId);
   },
   // public: the storefront's physician / clinic bar shows this to patients
