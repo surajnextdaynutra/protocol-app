@@ -117,6 +117,8 @@ export async function demoIdSet() {
 
 export function clearDemoCache() {
   demoCache = null;
+  // the theme reads the demo trio from the shop metafield - keep it current
+  import("./demo-sync.server.js").then((m) => m.scheduleDemoSync()).catch(() => {});
 }
 
 /** True when ANY id on this order / prescription is a demo id. */

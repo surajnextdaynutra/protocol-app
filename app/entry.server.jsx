@@ -23,6 +23,10 @@ if (!globalThis.__rxMfDefsStarted) {
       .then((m) => m.ensureProductMetafieldDefinitions())
       .then((r) => r.created.length && console.log("[rx] metafield definitions created:", r.created.join(", ")))
       .catch((err) => console.warn("[rx] metafield definitions not checked:", err.message || err));
+    // The theme's demo view reads the demo trio from the shop metafield rx.demo.
+    import("./services/demo-sync.server.js")
+      .then((m) => m.syncDemoToShop())
+      .catch((err) => console.warn("[rx] demo trio not synced to the theme:", err.message || err));
   }, 5000);
 }
 
