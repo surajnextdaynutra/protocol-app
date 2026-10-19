@@ -34,12 +34,25 @@ import { authenticate } from "../shopify.server";
 
 async function nameMap() {
   const map = {};
-  for (const a of await Account.find({}, { first: 1, last: 1, company: 1, doctorId: 1, clinicId: 1, practiceId: 1, repId: 1 }).lean()) {
+  const accounts = await Account.find({}, {
+    first: 1, last: 1, company: 1, practiceName: 1, clinicName: 1,
+    doctorId: 1, clinicId: 1, practiceId: 1, repId: 1,
+  }).lean();
+  for (const a of accounts) {
     const person = `${a.first} ${a.last}`.trim();
     if (a.repId) map["Rep|" + a.repId] ||= person;
     else if (a.doctorId) map["Doctor|" + a.doctorId] ||= person;
     else if (a.clinicId) map["Clinic|" + a.clinicId] ||= a.company || person;
     else if (a.practiceId) map["Practice|" + a.practiceId] ||= a.company || person;
+  }
+  // A solo doctor is practice + clinic + doctor on ONE account (it carries a
+  // doctor_id), so its practice and clinic have no master account of their
+  // own and showed no name. Fall back to the account that holds the id.
+  for (const a of accounts) {
+    if (a.repId) continue;
+    const label = a.company || `${a.first} ${a.last}`.trim();
+    if (a.practiceId) map["Practice|" + a.practiceId] ||= a.practiceName || label;
+    if (a.clinicId) map["Clinic|" + a.clinicId] ||= a.clinicName || label;
   }
   for (const r of await SalesRep.find({}, { repId: 1, name: 1 }).lean()) map["Rep|" + r.repId] ||= r.name;
   return map;

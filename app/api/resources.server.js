@@ -453,9 +453,10 @@ const physicians = {
         tags: ["wholesale", ...(c.tags || []).filter((t) => PUBLIC_TAG.test(t))],
       });
     }
-    return new Response(JSON.stringify(out), {
-      headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=300" },
-    });
+    // Plain array -> the server's response cache (cleared on every account
+    // write) serves repeats, sent no-store. The old 5-minute browser cache
+    // kept showing a clinic location after it was changed in the app.
+    return out;
   },
 };
 
