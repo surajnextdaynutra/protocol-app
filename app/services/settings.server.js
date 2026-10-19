@@ -134,8 +134,6 @@ export async function setSetting(key, value) {
     { upsert: true },
   );
   cache = null;
-  // new demo ids apply at once (not after the 60 s cache) and reach the theme
-  if (key === "DEMO_IDS") import("./ids.server.js").then((m) => m.clearDemoCache()).catch(() => {});
 }
 
 export async function setSettings(map) {
