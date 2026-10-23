@@ -29,8 +29,8 @@ const CACHEABLE = {
   rep: ["repdash"],
   finance: ["admindash", "orderDetail"],
   account: ["getAccount", "orderHistory"],
-  about: ["aboutUsLoad"],
-  physicians: ["customers"],
+  about: ["aboutUsLoad", "aboutUsPublic"],
+  physicians: ["customers", "refLookup"],
 };
 // reads that are never cached (banking) still don't clear the cache
 const READ_ONLY = new Set([...Object.values(CACHEABLE).flat(), "ping", "load", "bankingLoad", "guardcheck"]);

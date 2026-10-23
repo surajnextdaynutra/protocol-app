@@ -1,12 +1,17 @@
 import { connectDb } from "../db.server";
 import { Order } from "../models/index.server";
+import { normalizePhone, validateAddress, validatePersonal } from "./account-validate.server";
 import { gid, gql } from "./shopify-admin.server";
 
 /* My Account (was "Account Settings API" + the getAccount / updateAccount
    actions duplicated in the dashboard scripts). Always acts on the logged-in
    customer Shopify identified - never on an id sent by the page. */
 
-const ADDRESS_FIELD_LABELS = {
+const FIELD_LABELS = {
+  firstName: "First Name",
+  lastName: "Last Name",
+  email: "Email",
+  phone: "Phone",
   company: "Clinic / Business Name",
   address1: "Address Line 1",
   address2: "Address Line 2",
@@ -15,21 +20,32 @@ const ADDRESS_FIELD_LABELS = {
   zip: "ZIP / Postal Code",
   country: "Country",
 };
+// Shopify's userErrors field names -> the page's data-acct-field keys
+const SHOPIFY_FIELD_KEYS = { provinceCode: "province", countryCode: "country", first_name: "firstName", last_name: "lastName" };
 
-/** Shopify's address errors ("Province is invalid") turned into one plain
- *  line naming the fields to fix. */
-function addressErrorMessage(userErrors) {
-  const labels = [];
+/** Shopify userErrors keyed by page field, e.g. { phone: "Phone has already been taken" }.
+ *  Errors Shopify doesn't tie to a known field go under fallbackKey. */
+function shopifyFieldErrors(userErrors, fallbackKey) {
+  const out = {};
   for (const e of userErrors) {
-    const key = (e.field || [])[(e.field || []).length - 1];
-    const label = ADDRESS_FIELD_LABELS[key] || "Address";
-    if (!labels.includes(label)) labels.push(label);
+    const path = e.field || [];
+    let key = path[path.length - 1];
+    key = SHOPIFY_FIELD_KEYS[key] || key;
+    if (!FIELD_LABELS[key]) key = fallbackKey;
+    if (!out[key]) out[key] = e.message;
   }
-  const which = labels.length ? labels.join(", ") : "your Shipping Address";
-  return (
-    `Your Shipping Address looks incomplete or incorrect (${which}). ` +
-    "Please double check that City, State/Province, and Country are spelled correctly and match a real location."
-  );
+  return out;
+}
+
+/** { ok:false, error, fieldErrors } - error names every field to fix. */
+function fieldFailure(fieldErrors, extra = {}) {
+  const labels = Object.keys(fieldErrors).map((k) => FIELD_LABELS[k] || k);
+  return {
+    ok: false,
+    error: `Please fix: ${labels.join(", ")}.`,
+    fieldErrors,
+    ...extra,
+  };
 }
 
 /** Placed through the wholesale order page? Its "Wholesale Role" attribute or
@@ -114,17 +130,21 @@ export async function updateAccount(customerId, payload) {
   const has = (k) => Object.prototype.hasOwnProperty.call(payload, k);
   const touchesPersonal = ["firstName", "lastName", "email", "phone"].some(has);
   const touchesAddress = ["address1", "address2", "city", "province", "zip", "country", "company"].some(has);
+  if (!touchesPersonal && !touchesAddress) return { ok: false, error: "Nothing to save - no account fields were sent." };
   const id = gid.customer(customerId);
+  const str = (k) => String(payload[k] ?? "").trim();
 
+  // Both sections are checked before either is saved, so one bad field
+  // never leaves a half-saved account.
+  const fieldErrors = {
+    ...(touchesPersonal ? validatePersonal(payload) : {}),
+    ...(touchesAddress ? validateAddress(payload) : {}),
+  };
+  if (Object.keys(fieldErrors).length) return fieldFailure(fieldErrors);
+
+  let personalSaved = false;
+  let addressId = String(payload.addressId || "");
   if (touchesPersonal) {
-    const missing = [];
-    if (!String(payload.firstName || "").trim()) missing.push("First Name");
-    if (!String(payload.lastName || "").trim()) missing.push("Last Name");
-    if (!String(payload.email || "").trim()) missing.push("Email");
-    if (missing.length) return { ok: false, error: "Please fill in: " + missing.join(", ") };
-    if (!String(payload.email).includes("@")) {
-      return { ok: false, error: "Please enter a valid Email address" };
-    }
     const res = await gql(
       `#graphql
       mutation RxAccountUpdate($input: CustomerInput!) {
@@ -133,26 +153,27 @@ export async function updateAccount(customerId, payload) {
       {
         input: {
           id,
-          firstName: payload.firstName || "",
-          lastName: payload.lastName || "",
-          email: payload.email || "",
-          phone: payload.phone || null,
+          firstName: str("firstName"),
+          lastName: str("lastName"),
+          email: str("email"),
+          phone: normalizePhone(str("phone")) || null,
         },
       },
     );
     const errs = res.customerUpdate.userErrors;
-    if (errs.length) return { ok: false, error: errs.map((e) => e.message).join("; ") };
+    if (errs.length) return fieldFailure(shopifyFieldErrors(errs, "email"));
+    personalSaved = true;
   }
 
   if (touchesAddress) {
     const address = {
-      company: payload.company || "",
-      address1: payload.address1 || "",
-      address2: payload.address2 || "",
-      city: payload.city || "",
-      province: payload.province || "",
-      zip: payload.zip || "",
-      country: payload.country || "",
+      company: str("company"),
+      address1: str("address1"),
+      address2: str("address2"),
+      city: str("city"),
+      province: str("province"),
+      zip: str("zip"),
+      country: str("country"),
     };
     if (payload.addressId) {
       const upd = await gql(
@@ -165,8 +186,8 @@ export async function updateAccount(customerId, payload) {
         { addressId: payload.addressId, address, customerId: id },
       );
       const errs = upd.customerAddressUpdate.userErrors;
-      if (errs.length) return { ok: false, error: addressErrorMessage(errs) };
-    } else {
+      if (errs.length) return fieldFailure(shopifyFieldErrors(errs, "address1"), { personalSaved });
+    } else if (Object.values(address).some(Boolean)) {
       const created = await gql(
         `#graphql
         mutation RxAddressCreate($customerId: ID!, $address: MailingAddressInput!) {
@@ -178,8 +199,10 @@ export async function updateAccount(customerId, payload) {
         { customerId: id, address },
       );
       const errs = created.customerAddressCreate.userErrors;
-      if (errs.length) return { ok: false, error: addressErrorMessage(errs) };
+      if (errs.length) return fieldFailure(shopifyFieldErrors(errs, "address1"), { personalSaved });
+      // the page keeps it, so its next save updates this address instead of adding another
+      addressId = created.customerAddressCreate.address?.id || "";
     }
   }
-  return { ok: true };
+  return { ok: true, addressId };
 }

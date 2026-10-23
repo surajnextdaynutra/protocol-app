@@ -1,4 +1,4 @@
-import { loadAbout, saveAbout, uploadAboutImage } from "../services/about.server";
+import { loadAbout, publicAbout, saveAbout, uploadAboutImage } from "../services/about.server";
 import { getAccount, orderHistory, updateAccount } from "../services/account.server";
 import { loadBanking, saveBanking } from "../services/banking.server";
 import {
@@ -50,6 +50,8 @@ import {
   updateProductCommission,
   updateProductPrice,
 } from "../services/products.server";
+import { idsFromCustomerTags } from "../services/ids.server";
+import { searchCustomers } from "../services/shopify-admin.server";
 
 /* resource -> action -> handler({ p, caller, ... }).
    `p` is the merged query + JSON body. Ids in `p` are what the page asked
@@ -204,7 +206,17 @@ const practice = {
   },
   updateAccount: ({ p, caller }) => {
     requireLogin(caller);
-    return updateAccount(caller.customerId, p);
+    // Older theme builds send the fields packed as ?payload=<json> (an Apps
+    // Script redirect workaround) - unpack it, or nothing gets saved.
+    let fields = p;
+    if (typeof p.payload === "string" && p.payload) {
+      try {
+        fields = { ...JSON.parse(p.payload), action: p.action };
+      } catch {
+        return { ok: false, error: "bad json" };
+      }
+    }
+    return updateAccount(caller.customerId, fields);
   },
   updatePrice: async ({ p, caller }) => {
     requireLogin(caller);
@@ -322,7 +334,7 @@ const clinic = {
     const fields = p.fields && typeof p.fields === "object" ? { ...p.fields } : {};
     delete fields.clinic_id;
     const res = await saveBanking("clinic", id, fields, caller.customerId, { lock: false });
-    return res.error ? { ok: false, error: res.error } : { ok: true, handle: res.handle };
+    return res.error ? { ok: false, error: res.error, fieldErrors: res.fieldErrors } : { ok: true, handle: res.handle };
   },
   getAccount: practice.getAccount,
   updateAccount: practice.updateAccount,
@@ -393,8 +405,10 @@ const about = {
     const fields = Array.isArray(p.fields) ? p.fields : [];
     const val = (k) => String((fields.find((x) => x && x.key === k) || {}).value || "").trim();
     await requireAboutScope(caller, { doctor_id: val("doctor_id"), clinic_id: val("clinic_id"), practice_id: val("practice_id") });
-    return saveAbout(fields);
+    return saveAbout(fields, caller.customerId);
   },
+  // Storefront About page + header names - no login (visitors are patients).
+  aboutUsPublic: ({ p }) => publicAbout(p),
   aboutUsUploadImage: ({ p, caller }) => {
     requireLogin(caller);
     if (!caller.isWholesale && !caller.isRep && !caller.isFinance) {
@@ -457,6 +471,26 @@ const physicians = {
     // write) serves repeats, sent no-store. The old 5-minute browser cache
     // kept showing a clinic location after it was changed in the app.
     return out;
+  },
+  /* Clean referral link (/DrName-PRO45678, the 404 script in theme.liquid):
+     doctor id -> its clinic + practice. Like the old Apps Script it does not
+     depend on the account list being complete: an account the app hasn't
+     synced is looked up live in Shopify by its doctor_id tag. */
+  refLookup: async ({ p }) => {
+    const doctor = String(p.doctor || "").trim();
+    // not-found is ok:false so the response cache never keeps it (the doctor may be added later)
+    if (!/^[A-Za-z]+\d+$/.test(doctor)) return { ok: false, found: false, error: "bad doctor id" };
+    await connectDb();
+    const exact = new RegExp(`^${doctor}$`, "i");
+    const acct = await Account.findOne({ doctorId: exact, clinicId: { $ne: "" }, practiceId: { $ne: "" } }).lean();
+    if (acct) return { ok: true, found: true, d: acct.doctorId, c: acct.clinicId, p: acct.practiceId };
+    for (const c of await searchCustomers(`tag:'doctor_id:${doctor}'`, 10)) {
+      const ids = idsFromCustomerTags(c.tags);
+      if (exact.test(ids.doctorId) && ids.clinicId && ids.practiceId) {
+        return { ok: true, found: true, d: ids.doctorId, c: ids.clinicId, p: ids.practiceId };
+      }
+    }
+    return { ok: false, found: false, error: "doctor not found" };
   },
 };
 

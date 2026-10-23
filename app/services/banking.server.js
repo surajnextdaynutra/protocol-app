@@ -1,5 +1,6 @@
 import { connectDb } from "../db.server";
 import { Account, Banking } from "../models/index.server";
+import { validateBanking } from "./account-validate.server";
 import { decryptJson, encryptJson } from "./crypto.server";
 import { logEvent } from "./log.server";
 import { getSettings } from "./settings.server";
@@ -119,8 +120,16 @@ export async function saveBanking(ownerType, ownerId, incoming, updatedBy = "", 
     ? incoming
     : Object.entries(incoming || {}).map(([key, value]) => ({ key, value }));
   for (const f of list) {
-    if (f && BANKING_KEYS.includes(f.key)) fields[f.key] = String(f.value == null ? "" : f.value);
+    if (f && BANKING_KEYS.includes(f.key)) fields[f.key] = String(f.value == null ? "" : f.value).trim();
   }
+  // Every field checked before anything is stored; each failure is keyed by
+  // the form's field name so the page can show it under that field.
+  const fieldErrors = validateBanking(fields);
+  if (Object.keys(fieldErrors).length) {
+    return { error: "Please fix the highlighted fields.", fieldErrors };
+  }
+  fields.bank_routing_ach = fields.bank_routing_ach.replace(/[\s-]/g, "");
+  fields.bank_holder_account_number = fields.bank_holder_account_number.replace(/[\s-]/g, "");
   if (!fields.display_name) fields.display_name = ownerId;
   fields[`${ownerType === "physician" ? "doctor" : ownerType}_id`] = ownerId;
 
